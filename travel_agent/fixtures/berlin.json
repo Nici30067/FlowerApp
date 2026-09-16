@@ -1,0 +1,17 @@
+{
+  "notice": "Synthetic demonstration data. Names and coordinates illustrate central Berlin. Hours, prices, weather, visit durations, route distances and route geometry are fixtures, not verified travel information. No OSM identifiers have been fabricated.",
+  "places": [
+    {"id":"demo-monbijou","name":"Monbijou Park","lat":52.5232,"lon":13.3967,"categories":["parks","architecture"],"indoor":false,"cost_minor":0,"duration_s":2400,"hours":"08:00-20:00","description":"Outdoor riverside visit in the demonstration."},
+    {"id":"demo-museum-walk","name":"Museum Island promenade","lat":52.5208,"lon":13.4003,"categories":["architecture","parks","art"],"indoor":false,"cost_minor":0,"duration_s":2700,"hours":"08:00-20:00","description":"Outdoor architecture stop in the demonstration."},
+    {"id":"demo-nationalgalerie","name":"Alte Nationalgalerie","lat":52.5210,"lon":13.3985,"categories":["art"],"indoor":true,"cost_minor":1400,"duration_s":3600,"hours":"10:00-18:00","description":"Indoor art alternative. Admission and hours are simulated."},
+    {"id":"demo-neues","name":"Neues Museum","lat":52.5201,"lon":13.3989,"categories":["history","art","architecture"],"indoor":true,"cost_minor":1400,"duration_s":4200,"hours":"10:00-18:00","description":"Indoor museum alternative. Admission and hours are simulated."},
+    {"id":"demo-gallery","name":"James-Simon-Galerie","lat":52.5200,"lon":13.3974,"categories":["architecture","art"],"indoor":true,"cost_minor":0,"duration_s":2400,"hours":"10:00-18:00","description":"Illustrative indoor architecture stop; access is unverified."},
+    {"id":"demo-forum","name":"Humboldt Forum","lat":52.5170,"lon":13.4012,"categories":["art","history","architecture"],"indoor":true,"cost_minor":0,"duration_s":3600,"hours":"10:00-18:00","description":"Illustrative indoor alternative with simulated free access."},
+    {"id":"demo-coffee","name":"Hackescher Markt coffee stop","lat":52.5228,"lon":13.4020,"categories":["coffee","food"],"indoor":true,"cost_minor":900,"duration_s":1800,"hours":"08:00-19:00","description":"Synthetic cafe stop and meal allowance; not a named business."},
+    {"id":"demo-courtyards","name":"Hackesche Hoefe courtyards","lat":52.5240,"lon":13.4021,"categories":["architecture","art"],"indoor":false,"cost_minor":0,"duration_s":2700,"hours":"09:00-18:00","description":"Outdoor courtyard stop in the demonstration."},
+    {"id":"demo-cathedral","name":"Berlin Cathedral interior","lat":52.5191,"lon":13.4010,"categories":["architecture","history"],"indoor":true,"cost_minor":1000,"duration_s":2700,"hours":"10:00-17:00","description":"Interior visit with simulated admission and hours."},
+    {"id":"demo-bebelplatz","name":"Bebelplatz","lat":52.5163,"lon":13.3936,"categories":["architecture","history"],"indoor":false,"cost_minor":0,"duration_s":2400,"hours":"08:00-20:00","description":"Outdoor architecture stop in the demonstration."},
+    {"id":"demo-bookshop","name":"Mitte bookshop stop","lat":52.5234,"lon":13.3993,"categories":["books","art"],"indoor":true,"cost_minor":0,"duration_s":1800,"hours":"10:00-18:00","description":"Synthetic indoor bookshop candidate; not a named business."},
+    {"id":"demo-alexanderplatz","name":"Alexanderplatz","lat":52.5219,"lon":13.4132,"categories":["architecture","shopping"],"indoor":false,"cost_minor":0,"duration_s":2400,"hours":"08:00-20:00","description":"More distant outdoor candidate in the demonstration."}
+  ]
+}

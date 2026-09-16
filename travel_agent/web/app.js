@@ -299,32 +299,32 @@ function renderMap() {
   const s=$('schematic');if(!s)return;s.replaceChildren();const b=bounds(),trip=view();
   const xy=p=>[40+(p.lon-b.minLon)/(b.maxLon-b.minLon)*820,70+(b.maxLat-p.lat)/(b.maxLat-b.minLat)*450];
   state.projection={bounds:b,xy};
-  for(let x=0;x<950;x+=65)s.append(svg('line',{x1:x,y1:0,x2:x,y2:590,stroke:'#dbe4d6','stroke-width':.8}));
-  for(let y=0;y<650;y+=65)s.append(svg('line',{x1:0,y1:y,x2:900,y2:y,stroke:'#dbe4d6','stroke-width':.8}));
-  s.append(svg('text',{x:860,y:91,fill:'#829782','font-size':12,'text-anchor':'middle'},'N'),svg('path',{d:'M 860 104 L 854 120 L 860 116 L 866 120 Z',fill:'#829782'}));
+  for(let x=0;x<950;x+=65)s.append(svg('line',{x1:x,y1:0,x2:x,y2:590,stroke:'#ece3d3','stroke-width':.8}));
+  for(let y=0;y<650;y+=65)s.append(svg('line',{x1:0,y1:y,x2:900,y2:y,stroke:'#ece3d3','stroke-width':.8}));
+  s.append(svg('text',{x:860,y:91,fill:'#8a7c6d','font-size':12,'text-anchor':'middle'},'N'),svg('path',{d:'M 860 104 L 854 120 L 860 116 L 866 120 Z',fill:'#8a7c6d'}));
   function route(legs,old=false) {
     for(const l of legs||[]){if(!l.geometry?.length)continue;const pts=l.geometry.map(([lon,lat])=>xy({lat,lon}).join(',')).join(' ');
-      s.append(svg('polyline',{points:pts,fill:'none',stroke:old?'#c2ab8a':'#267f5d','stroke-width':old?5:3,'stroke-linecap':'round','stroke-linejoin':'round','stroke-dasharray':l.source_status==='fixture'?'7 6':'none',opacity:old?.45:.9}));}
+      s.append(svg('polyline',{points:pts,fill:'none',stroke:old?'#c2ab8a':'#ba5a34','stroke-width':old?5:3,'stroke-linecap':'round','stroke-linejoin':'round','stroke-dasharray':l.source_status==='fixture'?'7 6':'none',opacity:old?.45:.9}));}
   }
   if(state.proposal)route(state.trip?.itinerary?.legs,true);route(trip?.itinerary?.legs);
   const active=new Map((trip?.itinerary?.stops||[]).map((s,i)=>[s.place_id,i+1]));
   for(const p of trip?.places||[]) {
     const [x,y]=xy(p.coordinate),index=active.get(p.id);const g=svg('g',{tabindex:0,role:'button','aria-label':p.name,style:'cursor:pointer'});
     g.onclick=()=>showPlace(p.id);g.onkeydown=e=>{if(e.key==='Enter')showPlace(p.id);};
-    if(index){g.append(svg('circle',{cx:x,cy:y,r:21,fill:'#206e51',stroke:'#fff','stroke-width':4}));g.append(svg('text',{x,y:y+4,fill:'#fff','font-size':13,'text-anchor':'middle','font-weight':600},index));}
-    else g.append(svg('circle',{cx:x,cy:y,r:5,fill:'#9cb19b',stroke:'#eff4e9','stroke-width':2}));
+    if(index){g.append(svg('circle',{cx:x,cy:y,r:21,fill:'#ba5a34',stroke:'#fff','stroke-width':4}));g.append(svg('text',{x,y:y+4,fill:'#fff','font-size':13,'text-anchor':'middle','font-weight':600},index));}
+    else g.append(svg('circle',{cx:x,cy:y,r:5,fill:'#c2b8a8',stroke:'#f5efe3','stroke-width':2}));
     const label=p.name.length>25?p.name.slice(0,23)+'..':p.name;
-    if(index){g.append(svg('rect',{x:x-82,y:y+25,width:164,height:23,rx:5,fill:'#fffffff5'}));g.append(svg('text',{x,y:y+40,'text-anchor':'middle',fill:'#4c6753','font-size':9.5},label));}
+    if(index){g.append(svg('rect',{x:x-82,y:y+25,width:164,height:23,rx:5,fill:'#fffffff5'}));g.append(svg('text',{x,y:y+40,'text-anchor':'middle',fill:'#6b5d4f','font-size':9.5},label));}
     s.append(g);
   }
   const origin=state.trip?.progress.location||trip?.request.origin||state.origin;
   const [ox,oy]=xy(origin);s.append(svg('rect',{x:ox-6,y:oy-6,width:12,height:12,rx:3,fill:'#bd9659',stroke:'white','stroke-width':2}));
   s.append(svg('text',{x:ox+11,y:oy+4,fill:'#906d35','font-size':9,'font-weight':600},'START'));
   if(!trip?.places.length) {
-    s.append(svg('text',{x:450,y:272,'text-anchor':'middle',fill:'#73927a','font-size':17,'font-family':'Georgia'},'The route starts with your preferences.'));
-    s.append(svg('text',{x:450,y:299,'text-anchor':'middle',fill:'#98a996','font-size':11},'Build an itinerary to explore candidate places.'));
+    s.append(svg('text',{x:450,y:272,'text-anchor':'middle',fill:'#a89686','font-size':17,'font-family':'Georgia'},'The route starts with your preferences.'));
+    s.append(svg('text',{x:450,y:299,'text-anchor':'middle',fill:'#c2a488','font-size':11},'Build an itinerary to explore candidate places.'));
   }
-  s.append(svg('text',{x:25,y:541,fill:'#8c9c86','font-size':9},`${b.minLat.toFixed(3)} N / ${b.minLon.toFixed(3)} E`));
+  s.append(svg('text',{x:25,y:541,fill:'#a89686','font-size':9},`${b.minLat.toFixed(3)} N / ${b.minLon.toFixed(3)} E`));
   $('route-label').textContent=trip?.data_mode==='fixture'?'Synthetic direct-line routes. Not walking directions.':'Coordinate schematic. Load OSM for the road map.';
   s.onclick=e=>{
     if(!state.selecting)return;
@@ -336,7 +336,7 @@ function renderLeaflet() {
   const L=window.L,trip=view();state.layer.clearLayers();let box=[];
   for(const l of trip?.itinerary?.legs||[]) {
     if(l.geometry.length>1)L.geoJSON({type:'Feature',properties:{},geometry:{type:'LineString',coordinates:l.geometry}},
-      {style:{color:'#176c55',weight:4,dashArray:l.source_status==='fixture'?'8 7':null}}).addTo(state.layer);
+      {style:{color:'#ba5a34',weight:4,dashArray:l.source_status==='fixture'?'8 7':null}}).addTo(state.layer);
   }
   const active=new Map((trip?.itinerary?.stops||[]).map((s,i)=>[s.place_id,i+1]));
   for(const p of trip?.places||[]) {

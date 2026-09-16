@@ -140,7 +140,7 @@ class TripRequest(Contract):
 
         return shifted(self.start), shifted(self.end)
 
-    def day_request(self, index: int) -> "TripRequest":
+    def day_request(self, index: int) -> TripRequest:
         """This request projected onto a single day, for reuse by the single-day engine."""
         start, end = self.day_window(index)
         return self.model_copy(update={"start": start, "end": end, "days": 1})
@@ -152,6 +152,35 @@ class TripRequest(Contract):
     @property
     def trip_end(self) -> datetime:
         return self.day_window(self.days - 1)[1]
+
+
+class TripBrief(Contract):
+    """A partial, conversationally-built mirror of the planning-relevant TripRequest
+    fields. Every field is optional; travel_agent.intake fills it in turn by turn."""
+    city: str | None = None
+    date: str | None = None  # ISO "YYYY-MM-DD"
+    start_time: str | None = None  # "HH:MM" 24h
+    end_time: str | None = None  # "HH:MM" 24h
+    timezone: str | None = None
+    budget_minor: int | None = None
+    interests: list[str] = Field(default_factory=list)
+    max_walking_m: int | None = None
+    transport_mode: Literal["walking", "cycling"] | None = None
+    target_stops: int | None = None
+    avoid_rain_outdoor_visits: bool | None = None
+    title: str | None = None
+    days: int | None = None
+
+
+class IntakeMessage(Contract):
+    role: Literal["user", "assistant"]
+    text: str = Field(max_length=600)
+
+
+class IntakeTurn(Contract):
+    message: str = Field(max_length=600)
+    brief: TripBrief = Field(default_factory=TripBrief)
+    history: list[IntakeMessage] = Field(default_factory=list, max_length=20)
 
 
 class Leg(Contract):

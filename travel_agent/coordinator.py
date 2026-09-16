@@ -6,13 +6,15 @@ from datetime import datetime
 from uuid import uuid4
 
 from travel_agent.agents import Emit, ExecutionBudget, ToolDispatcher
-from travel_agent.planning.engine import points_for, schedule_order, search, validate
+from travel_agent.planning.engine import points_for, schedule_order, search, validate, validate_trip
 from travel_agent.providers.services import TravelProvider, key
 from travel_agent.schemas import (
     AgentMessage,
+    DayPlan,
     Evidence,
     ForecastInterval,
     Issue,
+    Itinerary,
     Progress,
     Proposal,
     Reservation,
@@ -32,7 +34,7 @@ def apply_event(snapshot: TripSnapshot, event: TripEvent) -> TripSnapshot:
         if not event.simulated:
             raise ValueError("Rain scenario injection must be labeled simulated")
         start = result.progress.now or result.request.start
-        result.weather_override = Weather(intervals=[ForecastInterval(start=start, end=result.request.end,
+        result.weather_override = Weather(intervals=[ForecastInterval(start=start, end=result.request.trip_end,
             precipitation_probability_pct=95, temperature_c=16)],
             source=Evidence(id="scenario-" + event.id, provider="User-injected weather scenario", status="fixture",
                 retrieved_at=start, note="Simulated event, not an observed forecast update."))
@@ -76,7 +78,7 @@ def apply_event(snapshot: TripSnapshot, event: TripEvent) -> TripSnapshot:
         if actual < 0:
             raise ValueError("Actual spending cannot be negative")
         moment = datetime.fromisoformat(p["completed_at"])
-        if not moment.tzinfo or moment < stop.start or moment > result.request.end:
+        if not moment.tzinfo or moment < stop.start or moment > result.request.trip_end:
             raise ValueError("Completion time must be timezone-aware and inside the trip period")
         if result.progress.now and moment < result.progress.now:
             raise ValueError("Progress cannot move backwards")
@@ -91,7 +93,7 @@ def apply_event(snapshot: TripSnapshot, event: TripEvent) -> TripSnapshot:
         req["reservations"] = [r for r in req["reservations"] if r["place_id"] != stop.place_id]
     elif event.kind == "user_running_late":
         moment = datetime.fromisoformat(p["now"])
-        if not moment.tzinfo or moment < (result.progress.now or result.request.start) or moment >= result.request.end:
+        if not moment.tzinfo or moment < (result.progress.now or result.request.start) or moment >= result.request.trip_end:
             raise ValueError("Updated time must move forward and remain inside the trip period")
         from travel_agent.schemas import Coordinate
         result.progress.now = moment
@@ -166,35 +168,106 @@ class Coordinator:
         ranking = list(dict.fromkeys(mobility.candidate_ids + discovery.candidate_ids + [p.id for p in work.places]))
         self.emit("planner.started", {"algorithm": "bounded_beam_search", "beam_width": 64,
                                       "candidate_count": len(ranking)})
-        itinerary = search(work, matrix, ranking)
-        work.itinerary = itinerary
-        budget_review = run("budget_pace", matrix)
-        # A reviewer can request one extra candidate-order repair. It cannot relax user constraints.
-        if budget_review.requests and budget_review.candidate_ids:
-            preferred = list(dict.fromkeys(budget_review.candidate_ids + ranking))
-            alternative = search(work, matrix, preferred)
-            if alternative.validation.valid and (not itinerary.validation.valid or alternative.score >= itinerary.score):
-                itinerary = alternative
-        if itinerary.validation.valid:
-            completed_count = len(work.progress.completed_place_ids)
-            precise = self.provider.geometry(itinerary.legs[completed_count:], points)
-            for leg in precise:
-                matrix[key(leg.from_id, leg.to_id)] = leg
-            order = [s.place_id for s in itinerary.stops if not s.completed]
-            # Keep the original completed prefix when reconstructing against directions metrics.
-            work.itinerary = original.itinerary if not event or event.kind != "stop_completed" else work.itinerary
-            # For progress events, apply_event already updated the historical activity.
-            if event and event.kind == "stop_completed":
-                work.itinerary = apply_event(original, event).itinerary
-            rebuilt = schedule_order(work, matrix, order)
-            if rebuilt is None:
-                itinerary.validation = Validation(valid=False, status="infeasible", issues=[Issue(
-                    code="DIRECTIONS_CONFLICT", severity="error",
-                    message="Final directions metrics conflict with the schedule. Refresh conditions or adjust constraints.")])
+
+        # Multi-day plans reuse the same (trip-level, run-once) specialist reports and ranking
+        # across every day; only the single-day search/schedule/refine steps repeat per day.
+        # Determine which stored day (if any) the current progress belongs to, so its historical
+        # completed prefix is preserved while other days start from a clean slate.
+        completed_ids = set(work.progress.completed_place_ids)
+        progress_day_index = 0
+        if original.itinerary:
+            for idx, day in enumerate(original.itinerary.days):
+                if any(s.place_id in completed_ids for s in day.stops):
+                    progress_day_index = idx
+                    break
+        event_itinerary = (apply_event(original, event).itinerary
+                           if event and event.kind == "stop_completed" else None)
+
+        days: list[DayPlan] = []
+        scheduled_ids: list[str] = []
+        cost_so_far = 0
+        day0_places, day0_weather, day0_matrix = work.places, work.weather, matrix
+        for k in range(work.request.days):
+            day_req = work.request.day_request(k)
+            day_req = day_req.model_copy(update={
+                "excluded_place_ids": list(dict.fromkeys(day_req.excluded_place_ids + scheduled_ids)),
+                "budget_minor": max(0, work.request.budget_minor - cost_so_far),
+            })
+            if k == 0:
+                day_places, day_weather, day_matrix = day0_places, day0_weather, day0_matrix
             else:
-                itinerary = rebuilt
-                itinerary.validation = validate(work, itinerary)
-        work.itinerary = itinerary
+                fresh = self.provider.search(day_req)
+                retained_ids = set(work.progress.completed_place_ids) | {r.place_id for r in work.request.reservations}
+                present = {p.id for p in fresh}
+                day_places = fresh + [p for p in work.places if p.id in retained_ids and p.id not in present]
+                day_weather = work.weather_override or self.provider.weather(day_req)
+                day_points = points_for(TripSnapshot(id=work.id, request=day_req, places=day_places))
+                day_matrix = self.provider.matrix(day_points, day_req.transport_mode)
+
+            day_snapshot = work.model_copy(update={"request": day_req, "places": day_places, "weather": day_weather})
+            day_snapshot.progress = work.progress if k == progress_day_index else Progress()
+            if event_itinerary is not None and k == progress_day_index:
+                day_snapshot.itinerary = event_itinerary.days[k] if k < len(event_itinerary.days) else None
+            else:
+                day_snapshot.itinerary = (original.itinerary.days[k]
+                    if original.itinerary and k < len(original.itinerary.days) else None)
+
+            day_place_ids = {p.id for p in day_places}
+            day_ranking = [pid for pid in ranking if pid in day_place_ids]
+            day_ranking += [pid for pid in day_place_ids if pid not in day_ranking]
+
+            itinerary = search(day_snapshot, day_matrix, day_ranking)
+
+            if k == 0:
+                work.itinerary = itinerary
+                budget_review = run("budget_pace", day_matrix)
+                # A reviewer can request one extra candidate-order repair. It cannot relax user constraints.
+                if budget_review.requests and budget_review.candidate_ids:
+                    preferred = list(dict.fromkeys(budget_review.candidate_ids + day_ranking))
+                    alternative = search(day_snapshot, day_matrix, preferred)
+                    if alternative.validation.valid and (not itinerary.validation.valid
+                                                          or alternative.score >= itinerary.score):
+                        itinerary = alternative
+
+            if itinerary.validation.valid:
+                completed_count = len(day_snapshot.progress.completed_place_ids)
+                day_points = points_for(day_snapshot)
+                precise = self.provider.geometry(itinerary.legs[completed_count:], day_points)
+                for leg in precise:
+                    day_matrix[key(leg.from_id, leg.to_id)] = leg
+                order = [s.place_id for s in itinerary.stops if not s.completed]
+                rebuilt = schedule_order(day_snapshot, day_matrix, order)
+                if rebuilt is None:
+                    itinerary.validation = Validation(valid=False, status="infeasible", issues=[Issue(
+                        code="DIRECTIONS_CONFLICT", severity="error",
+                        message="Final directions metrics conflict with the schedule. Refresh conditions or adjust constraints.")])
+                else:
+                    itinerary = rebuilt
+                    itinerary.validation = validate(day_snapshot, itinerary)
+
+            itinerary = itinerary.model_copy(update={"index": k, "date": day_req.start.date().isoformat()})
+            days.append(itinerary)
+            scheduled_ids += [s.place_id for s in itinerary.stops]
+            cost_so_far += itinerary.cost_minor
+
+        trip_itinerary = Itinerary(days=days,
+            walking_m=sum(d.walking_m for d in days), travel_duration_s=sum(d.travel_duration_s for d in days),
+            cost_minor=sum(d.cost_minor for d in days), unknown_cost_count=sum(d.unknown_cost_count for d in days),
+            score=sum(d.score for d in days))
+        # A day that never produced a schedule at all (search/schedule_order gave up outright)
+        # carries a specific diagnostic (e.g. NO_FEASIBLE_PLAN, DIRECTIONS_CONFLICT) that a
+        # from-scratch validate_trip recompute cannot reconstruct (it only re-checks generic
+        # schedule invariants against whatever stops exist, which is none here). Surface that
+        # day's own diagnosis directly rather than losing it behind a generic TOO_FEW_STOPS.
+        hard_fail = next((d for d in days if any(i.code in ("NO_FEASIBLE_PLAN", "DIRECTIONS_CONFLICT")
+                                                  for i in d.validation.issues)), None)
+        if hard_fail is not None:
+            trip_itinerary.validation = Validation(valid=False, status="infeasible",
+                issues=[i.model_copy(update={"day_index": hard_fail.index}) for i in hard_fail.validation.issues])
+        else:
+            trip_itinerary.validation = validate_trip(work, trip_itinerary)
+        work.itinerary = trip_itinerary
+        itinerary = trip_itinerary
         work.revision = original.revision + 1
         self.emit("validation.completed", itinerary.validation.model_dump(mode="json"))
         message = AgentMessage(sender="coordinator", recipient="user", kind="proposal",

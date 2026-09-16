@@ -17,11 +17,12 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import Field
 
+from travel_agent import intake
 from travel_agent.agents import ExecutionBudget, ModelRunner, RulesRunner, openai_client
 from travel_agent.coordinator import Coordinator, apply_event
 from travel_agent.flower_backend import FlowerBackend
 from travel_agent.providers.services import ProviderError, make_provider
-from travel_agent.schemas import Contract, Proposal, TripEvent, TripRequest, TripSnapshot
+from travel_agent.schemas import Contract, IntakeTurn, Proposal, TripEvent, TripRequest, TripSnapshot
 from travel_agent.store import Conflict, NotFound, Store
 
 WEB = Path(__file__).parent / "web"
@@ -126,7 +127,8 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
                 "tile_url": os.getenv("TRAVEL_TILE_URL", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
                 "default_request": TripRequest().model_dump(mode="json"),
                 "fixture_notice": "Synthetic Berlin scenario. Prices, hours, weather and direct-line routes are unverified fixtures.",
-                "model": flower.model if flower else (os.getenv("TRAVEL_MODEL", "") or None) if agent_mode == "model" else None}
+                "model": flower.model if flower else (os.getenv("TRAVEL_MODEL", "") or None) if agent_mode == "model" else None,
+                "supported_cities": sorted(intake.SUPPORTED_CITIES.values())}
 
     @app.post("/api/login")
     async def login(request: Request):
@@ -201,6 +203,26 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
         job = queue(snapshot)
         return {"trip_id": snapshot.id, "job": job}
 
+    @app.post("/api/intake")
+    def intake_turn(body: IntakeTurn):
+        brief = intake.parse(body.message, body.brief)
+        missing = intake.missing_fields(brief)
+        notes: list[str] = []
+        ready = False
+        request = None
+        if brief.city and not intake.is_supported_city(brief.city):
+            notes.append(f"'{brief.city}' isn't supported yet — only Berlin is available right now.")
+            reply = intake.next_question(brief) or ""
+        elif not missing:
+            request = intake.to_trip_request(brief, TripRequest())
+            ready = request is not None
+            reply = ("Great — I have everything I need. Building your itinerary now."
+                     if ready else "Something about that trip doesn't quite work yet — could you clarify?")
+        else:
+            reply = intake.next_question(brief) or ""
+        return {"reply": reply, "brief": brief.model_dump(mode="json"), "missing": missing, "ready": ready,
+                "request": request.model_dump(mode="json") if request else None, "engine": "rules", "notes": notes}
+
     @app.get("/api/trips")
     def list_trips():
         return store.trip_list()
@@ -217,10 +239,11 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
 
     @app.post("/api/trips/import")
     def import_trip(body: TripSnapshot):
-        from travel_agent.planning.engine import validate
-        if len(body.places) > 24 or body.itinerary and len(body.itinerary.stops) > 8:
+        from travel_agent.planning.engine import validate_trip
+        stop_cap = 8 * body.request.days
+        if len(body.places) > 24 * body.request.days or (body.itinerary and len(body.itinerary.stops) > stop_cap):
             raise HTTPException(400, "Imported itinerary exceeds the MVP limits")
-        if body.itinerary and not validate(body, body.itinerary).valid:
+        if body.itinerary and not validate_trip(body, body.itinerary).valid:
             raise HTTPException(400, "Imported itinerary failed validation")
         body.id = uuid4().hex
         store.create_trip(body)

@@ -179,3 +179,40 @@ def test_cycling_profile_is_separate_from_walking(make_plan):
     assert p.proposed.itinerary.validation.valid
     assert p.proposed.itinerary.walking_m == 0
     assert all(l.mode == "cycling" for l in p.proposed.itinerary.legs)
+
+
+def test_multi_day_plan_produces_one_day_per_trip_day(make_plan):
+    request = TripRequest(days=3, budget_minor=6000)
+    p, _, _ = make_plan(TripSnapshot(id="trip3", request=request))
+    itinerary = p.proposed.itinerary
+    assert len(itinerary.days) == 3
+    assert [d.index for d in itinerary.days] == [0, 1, 2]
+    dates = [d.date for d in itinerary.days]
+    assert dates == sorted(dates)
+    from datetime import date as date_cls
+    parsed = [date_cls.fromisoformat(d) for d in dates]
+    assert (parsed[1] - parsed[0]).days == 1
+    assert (parsed[2] - parsed[1]).days == 1
+    all_ids = [s.place_id for d in itinerary.days for s in d.stops]
+    assert len(all_ids) == len(set(all_ids))
+    assert itinerary.cost_minor == sum(d.cost_minor for d in itinerary.days)
+    assert itinerary.cost_minor <= request.budget_minor
+
+
+def test_multi_day_plan_flattens_through_itinerary_properties(make_plan):
+    request = TripRequest(days=2, budget_minor=6000)
+    p, _, _ = make_plan(TripSnapshot(id="trip2", request=request))
+    itinerary = p.proposed.itinerary
+    assert itinerary.stops == [s for d in itinerary.days for s in d.stops]
+    assert itinerary.legs == [l for d in itinerary.days for l in d.legs]
+    assert itinerary.end_arrival == itinerary.days[-1].end_arrival
+
+
+def test_multi_day_budget_is_whole_trip_not_per_day(make_plan):
+    # A budget too small to afford every day's stops individually still constrains the
+    # whole trip's accounted spending, not merely each day's own remaining slice.
+    request = TripRequest(days=3, budget_minor=1)
+    p, _, _ = make_plan(TripSnapshot(id="trip-tight", request=request))
+    itinerary = p.proposed.itinerary
+    assert itinerary.cost_minor <= request.budget_minor
+    assert itinerary.cost_minor == sum(d.cost_minor for d in itinerary.days)

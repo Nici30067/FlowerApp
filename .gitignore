@@ -19,3 +19,4 @@ reports/*.png
 reports/*.xml
 reports/coverage.json
 .DS_Store
+.claude/

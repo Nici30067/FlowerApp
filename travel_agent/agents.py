@@ -463,6 +463,10 @@ class ModelRunner:
         contract = instructions + self.FINAL_CONTRACT.format(example=json.dumps(example))
         if report is None:
             limit = self._next_limit(last, limit)
+            # Some providers (Gemini) reject a conversation that ends with an assistant turn, so the
+            # contract request always follows a user message.
+            if inputs and inputs[-1].get("type") == "message" and inputs[-1].get("role") == "assistant":
+                inputs.append({"role": "user", "content": "Finalize your specialist report now."})
             last = self._call(role, input=inputs, instructions=contract, max_output_tokens=limit)
             report = self._parse_report(response_text(last), role)
         if report is None:

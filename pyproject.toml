@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "osm-travel-companion"
-version = "0.3.1"
+version = "0.3.2"
 description = "Collaborative travel planning with specialist agents, OpenStreetMap, and validated itinerary revisions."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -57,7 +57,25 @@ reasoning-effort = "low"
 public-web = false
 
 [tool.flwr.app.config.travel]
-data-mode = "fixture"
+# Data providers of a Flower run come from these keys only (no environment variables inside a run).
+# "live" plans any geocoded city from the zero-key OpenStreetMap stack: Open-Meteo geocoding, Overpass,
+# OSRM (public FOSSGIS instance) and Open-Meteo weather. "fixture" plans the bundled, labeled central-Berlin day:
+#   flwr run . supergrid --run-config 'travel.data-mode="fixture"'
+data-mode = "live"
+# Sent in the User-Agent of every live request; the operators of the public instances ask for a reachable contact.
+contact = "osm-travel-companion Flower Hub AgentApp"
+# The public Overpass instance is only used with this explicit consent; set overpass-url to use your own.
+allow-public-overpass = true
+# osrm (public FOSSGIS instance, no key) or ors (OpenRouteService, requires ors-api-key).
+router = "osrm"
+# Empty strings select the built-in default endpoint of each service.
+osrm-url-template = ""
+overpass-url = ""
+ors-url = ""
+ors-api-key = ""
+weather-url = ""
+geocoder-url = ""
+# Legacy HTTPS bridge mode only.
 api-url = ""
 job-id = ""
 job-token = ""

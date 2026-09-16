@@ -138,7 +138,7 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
         yield
         pool.shutdown(wait=True)
 
-    app = FastAPI(title="OSM Travel Companion", version="0.3.1", lifespan=lifespan)
+    app = FastAPI(title="OSM Travel Companion", version="0.3.2", lifespan=lifespan)
     app.state.store = store
 
     @app.exception_handler(Conflict)
@@ -182,7 +182,7 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "version": "0.3.1"}
+        return {"status": "ok", "version": "0.3.2"}
 
     @app.get("/api/config")
     def config():
@@ -265,8 +265,7 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
             request = intake.to_trip_request(brief, TripRequest(), check.place)
             ready = request is not None
             reply = (f"Great, I have everything I need. Building your day in {request.city} now." if ready else
-                     "Something about that day does not work yet: it must end after it starts and last at most "
-                     "18 hours. Could you adjust the times?")
+                     intake.INVALID_WINDOW_REASON)
         elif not missing and check.status == "unavailable":
             reply = (f"I have everything except a confirmed location for {brief.city}. Send any message to retry "
                      "the lookup, or name another city.")

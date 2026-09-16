@@ -9,6 +9,9 @@ City support is a separate, explicit step. `resolve_city` consults the applicati
 central Berlin, in live mode whenever the geocoder resolves it. Berlin itself needs no lookup in fixture mode,
 so the offline demo keeps working without a network. `enrich_with_model` optionally asks a model to fill the
 brief from natural phrasing; every failure there falls back to the rules parser.
+
+`resolve_request` is the one-call form for the Flower AgentApp: a complete brief in, either a TripRequest or
+one user-facing sentence explaining why none could be built.
 """
 from __future__ import annotations
 
@@ -26,8 +29,15 @@ from travel_agent.providers.services import ProviderError, fixture_supported
 from travel_agent.schemas import GeoPlace, IntakeMessage, TripBrief, TripRequest
 
 FIXTURE_CITY = "Berlin"
+# How to reach live data from each front end; `resolve_city` appends one of these to an outside-fixture note.
+SERVE_LIVE_HINT = "Start scripts/serve_live.sh to plan other cities from live OpenStreetMap data."
+RUN_CONFIG_LIVE_HINT = ("Re-run with --run-config 'travel.data-mode=\"live\"' to plan it from live "
+                        "OpenStreetMap data.")
 # Seconds allowed for one model enrichment call; the rules parser has already answered by then.
 MODEL_TIMEOUT_S = 20.0
+# The phrase that opens the note for a place name the geocoder does not know; callers that drop such a name from
+# the brief (so the next answer is read as the city) match this constant instead of the wording.
+UNRESOLVED_PLACE_MARKER = "couldn't find a place called"
 
 _MONTHS = {name.lower(): i for i, name in enumerate(calendar.month_name) if name}
 _MONTHS.update({name.lower(): i for i, name in enumerate(calendar.month_abbr) if name})
@@ -363,12 +373,15 @@ class CityCheck:
     query: str = ""
 
 
-def resolve_city(city: str | None, lookup: Lookup | None = None, data_mode: str = "fixture") -> CityCheck:
+def resolve_city(city: str | None, lookup: Lookup | None = None, data_mode: str = "fixture", *,
+                 live_hint: str = SERVE_LIVE_HINT) -> CityCheck:
     """Decide whether `city` can be planned, geocoding it through `lookup` when that is needed.
 
     Fixture mode: the fixture city is supported without any lookup; any other name is geocoded and must lie
     within the fixture's radius of central Berlin. Live mode: any name the geocoder resolves. The fixture city
     also survives a failed lookup in either mode because the default request already describes central Berlin.
+    `live_hint` is the sentence that tells the user how to switch to live data when a real place lies outside
+    the fixture.
     """
     name = (city or "").strip()
     if not name:
@@ -397,14 +410,13 @@ def resolve_city(city: str | None, lookup: Lookup | None = None, data_mode: str 
                              note=f"I couldn't look up '{name}' right now: the place lookup is unavailable. "
                                   f"Try again in a moment{hint}")
         return CityCheck("unresolved", False, query=name,
-                         note=f"I couldn't find a place called '{name}'. Check the spelling or name the nearest "
+                         note=f"I {UNRESOLVED_PLACE_MARKER} '{name}'. Check the spelling or name the nearest "
                               "larger city.")
     if data_mode == "fixture" and not fixture_supported(place.coordinate):
         where = f"{place.name}, {place.country}" if place.country else place.name
         return CityCheck("outside_fixture", False, place, query=name,
-                         note=f"{where} is outside the bundled {FIXTURE_CITY} scenario, which this server plans from "
-                              "fixture data. Start scripts/serve_live.sh to plan other cities from live "
-                              "OpenStreetMap data.")
+                         note=f"{where} is outside the bundled {FIXTURE_CITY} scenario, which is planned from "
+                              f"fixture data here. {live_hint}")
     return CityCheck("resolved", True, place, query=name)
 
 
@@ -577,3 +589,59 @@ def enrich_with_model(message: str, brief: TripBrief, history: list[IntakeMessag
         return TripBrief.model_validate(merged)
     except Exception:
         return None
+
+
+def fill_default_window(brief: TripBrief, defaults: TripRequest) -> TripBrief:
+    """The brief with the clock window of `defaults` (10:00-17:00 for TripRequest()) filled in when it names none.
+
+    Opt-in for callers that would rather plan a day than ask for a time window, such as an AgentApp answering
+    "Plan a day in Tokyo tomorrow, art and coffee, budget 60" in one turn. Only a brief with neither a start nor
+    an end time changes; a half-stated window is left for `next_question` to ask about. Pure: returns a copy.
+    """
+    if brief.start_time or brief.end_time:
+        return brief
+    return brief.model_copy(update={"start_time": defaults.start.strftime("%H:%M"),
+                                    "end_time": defaults.end.strftime("%H:%M")})
+
+
+INVALID_WINDOW_REASON = ("Something about that day does not work yet: it must end after it starts and last at most "
+                         "18 hours. Could you adjust the times?")
+
+
+def resolve_request(brief: TripBrief, geocoder, data_mode: str,
+                    defaults: TripRequest) -> tuple[TripRequest | None, str | None]:
+    """Turn a complete brief into a TripRequest, or explain in one user-facing sentence why that is not possible.
+
+    `geocoder` is anything with `search(name) -> GeoPlace | None` (the Geocoder from make_geocoder, the API's
+    Geocodes protocol), a bare lookup callable, or None. `data_mode` is "fixture" or "live". Exactly one of the
+    two results is None:
+
+    * a brief with gaps -> (None, the next clarifying question)
+    * fixture mode, a real place outside the bundled Berlin scenario -> (None, a note that names the place and
+      suggests travel.data-mode="live"); fixture mode without any geocoder says the same for every name but
+      Berlin
+    * a name the geocoder does not know -> (None, "I couldn't find a place called ..."); a lookup outage ->
+      (None, "... lookup is unavailable ...") so the caller can keep the brief and retry
+    * a window that would not validate (end before start after rolling over midnight, or longer than 18 h) ->
+      (None, INVALID_WINDOW_REASON)
+    * otherwise -> (request, None) with city, timezone, origin and destination taken from the geocoded place
+      (or `defaults`, central Berlin, when the fixture city needed no lookup)
+
+    Pure apart from the one `geocoder.search` call; it never raises for provider faults.
+    """
+    missing = missing_fields(brief)
+    if missing:
+        return None, next_question(brief, data_mode=data_mode)
+    lookup = getattr(geocoder, "search", None)
+    if lookup is None and callable(geocoder):
+        lookup = geocoder
+    check = resolve_city(brief.city, lookup, data_mode, live_hint=RUN_CONFIG_LIVE_HINT)
+    if not check.supported:
+        if check.status == "unavailable" and lookup is None and data_mode == "fixture":
+            return None, (f"I can only plan {FIXTURE_CITY} from the bundled fixture data, and no place lookup is "
+                          f"configured to check '{check.query}'. {RUN_CONFIG_LIVE_HINT}")
+        return None, check.note or next_question(brief, check, data_mode=data_mode) or "That city cannot be planned."
+    request = to_trip_request(brief, defaults, check.place)
+    if request is None:
+        return None, INVALID_WINDOW_REASON
+    return request, None

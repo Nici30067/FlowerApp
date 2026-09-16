@@ -235,6 +235,28 @@ def test_make_provider_reads_router_environment(monkeypatch):
         make_provider('other')
 
 
+def test_make_provider_without_a_mode_reads_travel_data_mode(monkeypatch):
+    """Regression for the settings refactor: the environment path of make_provider is unchanged."""
+    for name in ('TRAVEL_DATA_MODE', 'TRAVEL_ROUTER', 'ORS_API_KEY', 'OSRM_URL_TEMPLATE', 'TRAVEL_CONTACT',
+                 'TRAVEL_ALLOW_PUBLIC_OVERPASS', 'TRAVEL_OVERPASS_URL'):
+        monkeypatch.delenv(name, raising=False)
+    assert make_provider().mode == 'fixture'  # TRAVEL_DATA_MODE unset = fixture, and no live validation runs
+    monkeypatch.setenv('TRAVEL_DATA_MODE', 'live')
+    with pytest.raises(ProviderError):
+        make_provider()  # live mode still requires TRAVEL_CONTACT
+    monkeypatch.setenv('TRAVEL_CONTACT', 'test@example.invalid')
+    monkeypatch.setenv('TRAVEL_ALLOW_PUBLIC_OVERPASS', 'true')
+    p = make_provider()
+    assert p.mode == 'live' and p.router == 'osrm' and p.osrm_url_template == OSRM_URL_TEMPLATE
+    assert p.http.client.headers['user-agent'] == 'OSMTravelCompanion/0.2 (test@example.invalid)'
+    assert make_provider('fixture').mode == 'fixture'  # an explicit mode wins over TRAVEL_DATA_MODE
+    monkeypatch.setenv('TRAVEL_OVERPASS_URL', '')
+    assert make_provider().overpass_url == 'https://overpass-api.de/api/interpreter'  # empty = default
+    monkeypatch.setenv('TRAVEL_OVERPASS_URL', 'http://overpass.example.invalid/api/interpreter')
+    with pytest.raises(ProviderError):
+        make_provider()  # endpoints stay HTTPS-only
+
+
 # --- HTTP client ------------------------------------------------------------------------------------------
 
 def test_per_request_timeout_is_forwarded():
@@ -518,3 +540,70 @@ def test_rainy_dense_city_plans_indoor_stops_with_osrm_legs():
     assert again.validation.valid and len(again.stops) >= request.min_stops
     assert all(leg.evidence_id == 'osrm-route' for leg in again.legs)
     assert counts['overpass'] == 1
+
+
+
+def test_cached_http_retries_busy_upstream_then_succeeds():
+    import httpx
+
+    from travel_agent.providers.services import CachedHTTP
+    calls = []
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(504, text="busy") if len(calls) == 1 else httpx.Response(200, json={"ok": True})
+    http = CachedHTTP("tester", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    slept = []
+    http.sleep = slept.append
+    data, cached = http.request("GET", "https://overpass-api.de/api/interpreter", ttl=10)
+    assert data == {"ok": True} and cached is False and len(calls) == 2 and slept == [2.0]
+
+
+def test_cached_http_gives_up_after_bounded_retries():
+    import httpx
+    import pytest
+
+    from travel_agent.providers.services import CachedHTTP, ProviderError
+    calls = []
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(503, text="busy")
+    http = CachedHTTP("tester", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    http.sleep = lambda s: None
+    with pytest.raises(ProviderError) as info:
+        http.request("GET", "https://overpass-api.de/api/interpreter", ttl=10)
+    assert info.value.status == 503 and len(calls) == 3
+
+
+def test_cached_http_does_not_retry_client_errors_or_bad_json():
+    import httpx
+    import pytest
+
+    from travel_agent.providers.services import CachedHTTP, ProviderError
+    calls = []
+    def handler(request):
+        calls.append(1)
+        return httpx.Response(400, text="bad")
+    http = CachedHTTP("tester", client=httpx.Client(transport=httpx.MockTransport(handler)))
+    http.sleep = lambda s: None
+    with pytest.raises(ProviderError):
+        http.request("GET", "https://example.org/x", ttl=10)
+    assert len(calls) == 1
+
+
+def test_overpass_query_uses_nodes_for_amenities_and_nwr_for_areas():
+    import urllib.parse
+
+    import httpx
+
+    from travel_agent.providers.services import LiveProvider
+    from travel_agent.schemas import TripRequest
+    bodies = []
+    def handler(request):
+        bodies.append(urllib.parse.unquote_plus(request.content.decode()))
+        return httpx.Response(200, json={"elements": []})
+    provider = LiveProvider(contact="tester", router="osrm", allow_public_overpass=True,
+                            client=httpx.Client(transport=httpx.MockTransport(handler)))
+    provider.search(TripRequest(interests=["coffee", "art", "parks"]))
+    body = bodies[0]
+    assert 'node["amenity"="cafe"]' in body and 'nwr["tourism"="museum"]' in body and 'nwr["leisure"="park"]' in body
+    assert 'nwr["amenity"' not in body

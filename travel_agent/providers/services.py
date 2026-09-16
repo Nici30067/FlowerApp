@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import re
 import threading
 import time
@@ -27,16 +26,24 @@ from travel_agent.schemas import (
     TripRequest,
     Weather,
 )
+from travel_agent.settings import (
+    DEFAULT_GEOCODER_URL,
+    DEFAULT_ORS_URL,
+    DEFAULT_OSRM_URL_TEMPLATE,
+    DEFAULT_OVERPASS_URL,
+    DEFAULT_WEATHER_URL,
+    ROUTERS,
+    ProviderSettings,
+)
 
 from .opening_hours import parse_hours
 
-OPEN_METEO_GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
-# The public FOSSGIS instance always uses "driving" as the path profile; the real profile is in the hostname path.
-OSRM_URL_TEMPLATE = "https://routing.openstreetmap.de/routed-{profile}/{service}/v1/driving"
+# The defaults live in travel_agent.settings (stdlib only, shared with the AgentApp); these names are kept for callers.
+OPEN_METEO_GEOCODING_URL = DEFAULT_GEOCODER_URL
+OSRM_URL_TEMPLATE = DEFAULT_OSRM_URL_TEMPLATE
 USER_AGENT = "OSMTravelCompanion/0.2"
 FIXTURE_CENTER = Coordinate(lat=52.5225, lon=13.4024)
 FIXTURE_RADIUS_M = 10000
-ROUTERS = ("osrm", "ors")
 _CODE = re.compile(r"[A-Za-z0-9_]{1,40}")
 
 
@@ -128,14 +135,19 @@ def error_code(response: httpx.Response | None) -> str | None:
     return code if isinstance(code, str) and _CODE.fullmatch(code) else None
 
 
+RETRY_STATUSES = {429, 502, 503, 504}
+RETRY_DELAYS_S = (2.0, 5.0)
+
+
 class CachedHTTP:
-    """In-process TTL cache. Contact and provider endpoints are operator configuration."""
+    """In-process TTL cache with bounded retries. Contact and provider endpoints are operator configuration."""
     def __init__(self, contact: str = "", client: httpx.Client | None = None, timeout: float = 12):
         agent = f"{USER_AGENT} ({contact.strip()})" if contact.strip() else USER_AGENT
         self.client = client or httpx.Client(timeout=timeout, follow_redirects=False, headers={"User-Agent": agent})
         self.cache: dict[str, tuple[float, dict]] = {}
         self.lock = threading.Lock()
         self.requests = 0
+        self.sleep = time.sleep  # replaced in tests
 
     def request(self, method: str, url: str, *, ttl: int, timeout: float | None = None, **kwargs) -> tuple[dict, bool]:
         # The per-request timeout is transport configuration, not part of the response identity.
@@ -146,21 +158,31 @@ class CachedHTTP:
                 return json.loads(json.dumps(cached[1])), True
         if timeout is not None:
             kwargs["timeout"] = timeout
-        try:
-            response = self.client.request(method, url, **kwargs)
-            self.requests += 1
-            response.raise_for_status()
-            if len(response.content) > 4_000_000:
-                raise ProviderError("Provider response exceeds the 4 MB limit")
-            data = response.json()
-            if not isinstance(data, dict):
-                raise ProviderError("Provider returned an unexpected JSON shape")
-        except (httpx.HTTPError, ValueError) as exc:
-            # Avoid displaying API keys, headers, or full request URLs in error messages.
-            response = getattr(exc, "response", None)
-            status = getattr(response, "status_code", None)
-            raise ProviderError(f"{urlparse(url).hostname} request failed ({status or type(exc).__name__})",
-                                status=status, code=error_code(response)) from None
+        attempt = 0
+        while True:
+            try:
+                response = self.client.request(method, url, **kwargs)
+                self.requests += 1
+                response.raise_for_status()
+                if len(response.content) > 4_000_000:
+                    raise ProviderError("Provider response exceeds the 4 MB limit")
+                data = response.json()
+                if not isinstance(data, dict):
+                    raise ProviderError("Provider returned an unexpected JSON shape")
+                break
+            except (httpx.HTTPError, ValueError) as exc:
+                # Shared public instances answer 429/5xx when busy; retry a bounded number of times with backoff.
+                response = getattr(exc, "response", None)
+                status = getattr(response, "status_code", None)
+                budget = (len(RETRY_DELAYS_S) if status in RETRY_STATUSES
+                          else 1 if isinstance(exc, httpx.TimeoutException) else 0)
+                if attempt < budget:
+                    self.sleep(RETRY_DELAYS_S[min(attempt, len(RETRY_DELAYS_S) - 1)])
+                    attempt += 1
+                    continue
+                # Avoid displaying API keys, headers, or full request URLs in error messages.
+                raise ProviderError(f"{urlparse(url).hostname} request failed ({status or type(exc).__name__})",
+                                    status=status, code=error_code(response)) from None
         with self.lock:
             if len(self.cache) > 200:
                 self.cache.clear()
@@ -172,7 +194,7 @@ class Geocoder:
     """Open-Meteo geocoding (no key). Populated places rank first, then the largest population."""
     def __init__(self, http: CachedHTTP, url: str = OPEN_METEO_GEOCODING_URL):
         if urlparse(url).scheme != "https":
-            raise ProviderError("GEOCODER_URL requires HTTPS")
+            raise ProviderError("The geocoder URL (GEOCODER_URL or travel.geocoder-url) requires HTTPS")
         self.http, self.url = http, url
 
     @staticmethod
@@ -295,20 +317,22 @@ class LiveProvider:
 
     def __init__(self, *, contact: str, ors_key: str = "", router: str = "osrm",
                  osrm_url_template: str = OSRM_URL_TEMPLATE, allow_public_overpass: bool = False,
-                 overpass_url: str = "https://overpass-api.de/api/interpreter",
-                 ors_url: str = "https://api.openrouteservice.org",
-                 weather_url: str = "https://api.open-meteo.com/v1/forecast",
-                 client: httpx.Client | None = None):
+                 overpass_url: str = DEFAULT_OVERPASS_URL, ors_url: str = DEFAULT_ORS_URL,
+                 weather_url: str = DEFAULT_WEATHER_URL, client: httpx.Client | None = None):
+        # The messages name both spellings: the environment variable of the local server and the run-config key
+        # of a Flower run, where no environment variables exist.
         if not contact.strip():
-            raise ProviderError("Live mode requires TRAVEL_CONTACT")
+            raise ProviderError("Live mode requires a contact (TRAVEL_CONTACT or travel.contact)")
         if router not in ROUTERS:
-            raise ProviderError("TRAVEL_ROUTER must be osrm or ors")
+            raise ProviderError("The router (TRAVEL_ROUTER or travel.router) must be osrm or ors")
         if router == "ors" and not ors_key.strip():
-            raise ProviderError("TRAVEL_ROUTER=ors requires ORS_API_KEY")
+            raise ProviderError("Router ors requires an OpenRouteService key (ORS_API_KEY or travel.ors-api-key)")
         if router == "osrm" and not valid_osrm_template(osrm_url_template):
-            raise ProviderError("OSRM_URL_TEMPLATE must be an https URL containing {profile} and {service}")
+            raise ProviderError("The OSRM URL template (OSRM_URL_TEMPLATE or travel.osrm-url-template) must be an "
+                                "https URL containing {profile} and {service}")
         if urlparse(overpass_url).hostname == "overpass-api.de" and not allow_public_overpass:
-            raise ProviderError("Explicitly enable TRAVEL_ALLOW_PUBLIC_OVERPASS or configure your own instance")
+            raise ProviderError("Explicitly enable the public Overpass instance (TRAVEL_ALLOW_PUBLIC_OVERPASS or "
+                                "travel.allow-public-overpass) or configure your own instance")
         for url in (overpass_url, ors_url, weather_url):
             if urlparse(url).scheme != "https":
                 raise ProviderError("Live provider endpoints require HTTPS")
@@ -324,7 +348,8 @@ class LiveProvider:
         filters.update(CATEGORY_FILTERS["art"] + CATEGORY_FILTERS["coffee"])
         lat, lon = request.origin.lat, request.origin.lon
         radius = 2500
-        queries = [f'nwr["{k}"="{v}"](around:{radius},{lat:.6f},{lon:.6f});out center tags {OVERPASS_PER_FILTER};'
+        queries = [f'{"node" if k in ("amenity", "shop") else "nwr"}["{k}"="{v}"](around:{radius},{lat:.6f},{lon:.6f});'
+                   f'out center tags {OVERPASS_PER_FILTER};'
                    for k, v in sorted(filters)]
         query = '[out:json][timeout:25];' + ''.join(queries)
         raw, cached = self.http.request("POST", self.overpass_url, ttl=900, timeout=30, data={"data": query})
@@ -493,23 +518,32 @@ class LiveProvider:
 
 def resolve_router() -> str:
     """The router live mode will use: TRAVEL_ROUTER when set, else ors when ORS_API_KEY is set, else osrm."""
-    explicit = os.getenv("TRAVEL_ROUTER", "").strip().lower()
-    return explicit or ("ors" if os.getenv("ORS_API_KEY", "").strip() else "osrm")
+    return ProviderSettings.from_env().router
 
 
-def make_provider(mode: str) -> TravelProvider:
+def make_provider(mode: str | None = None, settings: ProviderSettings | None = None) -> TravelProvider:
+    """The provider for `mode` ("fixture" or "live"), configured from `settings`.
+
+    Without `settings` the environment is read (TRAVEL_CONTACT, TRAVEL_ROUTER, ORS_API_KEY, ...), exactly as the
+    local server always did; a Flower run passes `ProviderSettings.from_run_config(context.run_config)` instead,
+    and the environment is never consulted then. `mode` overrides `settings.data_mode` when given.
+    """
+    settings = settings or ProviderSettings.from_env()
+    mode = mode or settings.data_mode
     if mode == "fixture":
         return FixtureProvider()
     if mode != "live":
         raise ProviderError("Unknown data mode")
-    return LiveProvider(contact=os.getenv("TRAVEL_CONTACT", ""), ors_key=os.getenv("ORS_API_KEY", ""),
-        router=resolve_router(), osrm_url_template=os.getenv("OSRM_URL_TEMPLATE", "") or OSRM_URL_TEMPLATE,
-        allow_public_overpass=os.getenv("TRAVEL_ALLOW_PUBLIC_OVERPASS", "false").lower() == "true",
-        overpass_url=os.getenv("TRAVEL_OVERPASS_URL", "https://overpass-api.de/api/interpreter"),
-        ors_url=os.getenv("ORS_BASE_URL", "https://api.openrouteservice.org"),
-        weather_url=os.getenv("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast"))
+    return LiveProvider(contact=settings.contact, ors_key=settings.ors_key, router=settings.router,
+                        osrm_url_template=settings.osrm_url_template,
+                        allow_public_overpass=settings.allow_public_overpass, overpass_url=settings.overpass_url,
+                        ors_url=settings.ors_url, weather_url=settings.weather_url)
 
 
-def make_geocoder() -> Geocoder:
-    """Geocoding needs no key; TRAVEL_CONTACT is optional but appended to the User-Agent when set."""
-    return Geocoder(CachedHTTP(os.getenv("TRAVEL_CONTACT", "")), url=os.getenv("GEOCODER_URL", "") or OPEN_METEO_GEOCODING_URL)
+def make_geocoder(settings: ProviderSettings | None = None) -> Geocoder:
+    """Geocoding needs no key; the contact is optional but appended to the User-Agent when set.
+
+    Without `settings` the environment is read (TRAVEL_CONTACT, GEOCODER_URL), as before.
+    """
+    settings = settings or ProviderSettings.from_env()
+    return Geocoder(CachedHTTP(settings.contact), url=settings.geocoder_url)

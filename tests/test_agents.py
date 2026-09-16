@@ -318,3 +318,18 @@ def test_tool_turn_message_items_are_read_when_output_text_is_absent(baseline):
     api = FakeResponses([SimpleNamespace(output=[Item(message)])])
     result = runner_for(api, turns=1).run("discovery", baseline, ToolDispatcher(baseline))
     assert result.candidate_ids == [pid] and len(api.calls) == 1
+
+
+def test_contract_call_never_ends_with_an_assistant_turn(baseline):
+    """Gemini rejects requests whose last input item is a model turn; the contract call must follow a user message."""
+    pid = baseline.places[0].id
+    api = FakeResponses([
+        SimpleNamespace(output=[Item({"type": "message", "role": "assistant",
+                                      "content": [{"type": "output_text", "text": "Let me think about the candidates."}]})],
+                        output_text="Let me think about the candidates."),
+        SimpleNamespace(output=[], output_text=report("discovery", [pid]))])
+    runner = ModelRunner(SimpleNamespace(responses=api), "test-model", lambda t, d: None, ExecutionBudget(), 1)
+    result = runner.run("discovery", baseline, ToolDispatcher(baseline))
+    assert result.candidate_ids == [pid]
+    last_input = api.calls[-1]["input"][-1]
+    assert last_input.get("role") == "user" and "Finalize" in last_input["content"]

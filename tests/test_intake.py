@@ -1,29 +1,41 @@
-from datetime import datetime
+"""Offline tests for the conversational intake: parsing, questions, city support through a fake lookup, the
+single-day TripRequest it builds and the AgentApp's `resolve_request` helper. No test touches the network."""
+from datetime import datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
 
 from travel_agent import intake
+from travel_agent.providers.services import ProviderError
 from travel_agent.schemas import TripBrief, TripRequest
 
 NOW = datetime(2026, 9, 16, 9, 0)
+TOKYO = {"name": "Tokyo", "lat": 35.6895, "lon": 139.69171, "timezone": "Asia/Tokyo", "country": "Japan"}
+PARIS = {"name": "Paris", "lat": 48.85341, "lon": 2.3488, "timezone": "Europe/Paris", "country": "France"}
+KREUZBERG = {"name": "Kreuzberg", "lat": 52.49973, "lon": 13.40338, "timezone": "Europe/Berlin", "country": "Germany"}
+POTSDAM = {"name": "Potsdam", "lat": 52.39886, "lon": 13.06566, "timezone": "Europe/Berlin", "country": "Germany"}
+COMPLETE = {"city": "Berlin", "date": "2027-01-05", "start_time": "10:00", "end_time": "17:00",
+            "interests": ["art", "history"]}
 
 
 def test_single_message_captures_most_fields():
-    brief = intake.parse(
-        "Berlin on 5 jan for 3 days, budget 60 euros, I like art and history", TripBrief(), now=NOW)
+    brief = intake.parse("Berlin on 5 jan for 3 days, budget 60 euros, I like art and history", TripBrief(), now=NOW)
     assert brief.city == "Berlin"
-    assert brief.date == "2027-01-05"  # next occurrence on/after NOW
-    assert brief.days == 3
+    assert brief.date == "2027-01-05"  # the next 5 January on or after NOW
     assert brief.budget_minor == 6000
     assert set(brief.interests) == {"art", "history"}
     assert intake.missing_fields(brief) == ["time_window"]
 
 
-def test_word_form_day_counts_are_parsed():
-    assert intake.parse("Two days in Berlin", TripBrief(), now=NOW).days == 2
-    assert intake.parse("a day trip to Berlin", TripBrief(), now=NOW).days == 1
-    assert intake.parse("five nights in Berlin", TripBrief(), now=NOW).days == 5
+def test_day_counts_are_a_note_not_a_field():
+    assert intake.parse("Two days in Berlin", TripBrief(), now=NOW).city == "Berlin"
+    assert intake.multi_day_mention("Two days in Berlin") == 2
+    assert intake.multi_day_mention("five nights in Berlin") == 5
+    assert intake.multi_day_mention("3 days, budget 60") == 3
+    assert intake.multi_day_mention("a day trip to Berlin") is None
+    assert intake.multi_day_mention("one day in Berlin, 10 to 5") is None
+    with pytest.raises(ValidationError):
+        TripBrief(days=2)
 
 
 def test_multi_turn_convergence():
@@ -36,6 +48,7 @@ def test_multi_turn_convergence():
 
     brief = intake.parse("5th of January", brief, now=NOW)
     assert brief.date == "2027-01-05"
+    assert brief.city == "Berlin"
     assert "time_window" in intake.missing_fields(brief)
 
     brief = intake.parse("10 to 5", brief, now=NOW)
@@ -58,36 +71,260 @@ def test_correction_updates_only_that_field():
     assert updated.interests == ["art"]
 
 
-def test_to_trip_request_builds_valid_request():
-    brief = TripBrief(city="Berlin", date="2027-01-05", start_time="10:00", end_time="17:00",
-                       interests=["art", "history"])
-    request = intake.to_trip_request(brief, TripRequest())
-    assert request is not None
-    assert isinstance(request, TripRequest)
-    assert request.start.tzinfo is not None
-    assert str(request.start.tzinfo.key if hasattr(request.start.tzinfo, "key") else request.start.tzinfo) \
-        or request.timezone == "Europe/Berlin"
-    assert request.start.utcoffset() is not None
-    assert request.interests == ["art", "history"]
+@pytest.mark.parametrize("message, city", [
+    ("I want to go to Paris", "Paris"),
+    ("New York next Friday, 10 to 5", "New York"),
+    ("Museums and parks in Zürich", "Zürich"),
+    ("Let's do Lisbon", "Lisbon"),
+    ("Munich please", "Munich"),
+    ("paris", "Paris"),
+    ("new york", "New York"),
+    ("Sure, Lisbon", "Lisbon"),
+    ("berlin tomorrow", "Berlin"),
+    ("Two days in Berlin", "Berlin"),
+    ("Plan a day in Tokyo tomorrow, art and coffee, budget 60", "Tokyo"),
+    ("art and history", None),
+    ("actually make it 3pm", None),
+    ("5th of January", None),
+    ("in January", None),
+    ("On Monday", None),
+    ("10 to 5", None),
+    ("Tomorrow", None),
+    ("something cheap", None),
+])
+def test_city_extraction(message, city):
+    assert intake.parse(message, TripBrief(), now=NOW).city == city
 
 
-def test_incomplete_brief_returns_none():
-    brief = TripBrief(city="Berlin")
-    assert intake.to_trip_request(brief, TripRequest()) is None
+def test_the_supergrid_sample_prompt_parses_in_one_turn():
+    brief = intake.parse("Plan a day in Tokyo tomorrow, art and coffee, budget 60", TripBrief(), now=NOW)
+    assert brief.city == "Tokyo" and brief.date == "2026-09-17" and brief.budget_minor == 6000
+    assert brief.interests == ["art", "coffee"]
+    assert intake.missing_fields(brief) == ["time_window"]
+    assert "time" in intake.next_question(brief, data_mode="live")
+
+
+def test_a_later_message_without_a_city_keeps_the_city():
+    brief = intake.parse("art and coffee, 10 to 5", TripBrief(city="Paris"), now=NOW)
+    assert brief.city == "Paris" and brief.start_time == "10:00" and brief.interests == ["art", "coffee"]
+
+
+def test_a_bare_lower_case_answer_only_counts_while_no_city_is_known():
+    assert intake.parse("lisbon", TripBrief(), now=NOW).city == "Lisbon"
+    assert intake.parse("lisbon", TripBrief(city="Paris"), now=NOW).city == "Paris"
+    assert intake.parse("Lisbon instead", TripBrief(city="Paris"), now=NOW).city == "Lisbon"
+
+
+def test_iso_date_is_not_mistaken_for_a_time_window():
+    brief = intake.parse("Berlin 2027-01-05", TripBrief(), now=NOW)
+    assert brief.date == "2027-01-05" and brief.start_time is None and brief.end_time is None
 
 
 def test_ambiguous_bare_date_resolves_on_or_after_now():
     brief = intake.parse("5 jan", TripBrief(), now=NOW)
-    resolved = datetime.fromisoformat(brief.date)
-    assert resolved.date() >= NOW.date()
+    assert datetime.fromisoformat(brief.date).date() >= NOW.date()
 
 
-def test_unsupported_city_flagged():
-    brief = intake.parse("I want to go to Paris", TripBrief(), now=NOW)
-    assert brief.city == "Paris"
-    assert not intake.is_supported_city(brief.city)
+def test_to_trip_request_builds_a_valid_single_day_request():
+    request = intake.to_trip_request(TripBrief(**COMPLETE), TripRequest())
+    assert isinstance(request, TripRequest)
+    assert request.city == "Berlin" and request.title == "A day in Berlin" and request.timezone == "Europe/Berlin"
+    assert request.start.isoformat() == "2027-01-05T10:00:00+01:00"
+    assert request.end.isoformat() == "2027-01-05T17:00:00+01:00"
+    assert request.interests == ["art", "history"]
+    assert (request.origin.lat, request.origin.lon) == (52.5225, 13.4024)  # the fixture centre: no place given
+    assert not hasattr(request, "days")
 
 
-def test_trip_brief_forbids_extra_fields():
+def test_to_trip_request_takes_origin_timezone_and_name_from_the_geocoded_place(geo):
+    brief = TripBrief(**{**COMPLETE, "city": "tokyo", "budget_minor": 4000, "target_stops": 1,
+                         "transport_mode": "cycling", "max_walking_m": 3000, "avoid_rain_outdoor_visits": False})
+    request = intake.to_trip_request(brief, TripRequest(), geo(**TOKYO))
+    assert request is not None
+    assert request.city == "Tokyo" and request.title == "A day in Tokyo" and request.timezone == "Asia/Tokyo"
+    assert request.start.utcoffset() == timedelta(hours=9)
+    assert (request.origin.lat, request.origin.lon) == (35.6895, 139.69171) and request.destination == request.origin
+    assert request.budget_minor == 4000 and request.transport_mode == "cycling" and request.max_walking_m == 3000
+    assert request.avoid_rain_outdoor_visits is False
+    assert request.target_stops == request.min_stops  # a one-stop wish is raised to the planner's minimum
+
+
+def test_to_trip_request_keeps_an_explicit_title_and_timezone():
+    brief = TripBrief(**{**COMPLETE, "title": "Museum crawl", "timezone": "Europe/Paris"})
+    request = intake.to_trip_request(brief, TripRequest())
+    assert request.title == "Museum crawl" and request.timezone == "Europe/Paris"
+    assert request.start.isoformat() == "2027-01-05T10:00:00+01:00"
+
+
+def test_to_trip_request_never_returns_a_broken_request():
+    assert intake.to_trip_request(TripBrief(city="Berlin"), TripRequest()) is None  # incomplete
+    overnight = TripBrief(**{**COMPLETE, "start_time": "09:00", "end_time": "08:00"})  # 23 hours
+    assert intake.to_trip_request(overnight, TripRequest()) is None
+    bad_zone = TripBrief(**{**COMPLETE, "timezone": "Mars/Olympus"})
+    assert intake.to_trip_request(bad_zone, TripRequest()) is None
+
+
+def test_an_end_before_the_start_rolls_into_the_next_day():
+    late = TripBrief(**{**COMPLETE, "start_time": "20:00", "end_time": "01:00"})
+    request = intake.to_trip_request(late, TripRequest())
+    assert request is not None and request.end.isoformat() == "2027-01-06T01:00:00+01:00"
+
+
+def test_city_support_in_fixture_mode(geo, fake_geocoder):
+    # Berlin needs no lookup at all, so the offline demo keeps working without a network.
+    assert intake.is_supported_city("Berlin") is True
+    down = fake_geocoder(error=ProviderError("geocoding-api.open-meteo.com request failed (ConnectError)"))
+    assert intake.resolve_city("berlin", down.search, "fixture").supported is True and down.queries == []
+    # Other names are geocoded and must lie within the bundled fixture's radius of central Berlin.
+    inside = intake.resolve_city("Kreuzberg", fake_geocoder(geo(**KREUZBERG)).search, "fixture")
+    assert inside.supported and inside.status == "resolved" and inside.place.name == "Kreuzberg" and inside.note == ""
+    outside = intake.resolve_city("Potsdam", fake_geocoder(geo(**POTSDAM)).search, "fixture")
+    assert not outside.supported and outside.status == "outside_fixture" and "serve_live.sh" in outside.note
+    paris = intake.resolve_city("Paris", fake_geocoder(geo(**PARIS)).search, "fixture")
+    assert not paris.supported and "Paris, France" in paris.note and paris.place.name == "Paris"
+    assert intake.is_supported_city("Paris", fake_geocoder(geo(**PARIS)).search, "fixture") is False
+    # No match, an outage and a rejected query are three different answers.
+    unknown = intake.resolve_city("Atlantis", fake_geocoder(None).search, "fixture")
+    assert unknown.status == "unresolved" and "Atlantis" in unknown.note and not unknown.supported
+    outage = intake.resolve_city("Paris", down.search, "fixture")
+    assert outage.status == "unavailable" and "Berlin" in outage.note and not outage.supported
+    refused = fake_geocoder(error=ValueError("Enter a place name of 2 to 80 characters"))
+    rejected = intake.resolve_city("X", refused.search)
+    assert rejected.status == "unresolved" and "2 to 80" in rejected.note
+    assert intake.resolve_city(None).status == "missing" and intake.is_supported_city("  ") is False
+
+
+def test_city_support_in_live_mode(geo, fake_geocoder):
+    tokyo = intake.resolve_city("Tokyo", fake_geocoder(geo(**TOKYO)).search, "live")
+    assert tokyo.supported and tokyo.status == "resolved" and tokyo.place.timezone == "Asia/Tokyo"
+    assert intake.is_supported_city("Paris", fake_geocoder(geo(**PARIS)).search, "live") is True
+    assert intake.is_supported_city("Atlantis", fake_geocoder(None).search, "live") is False
+    # Live mode geocodes Berlin too, but an outage still leaves the default (central Berlin) request usable.
+    down = fake_geocoder(error=ProviderError("down"))
+    assert intake.resolve_city("Berlin", down.search, "live").supported is True and down.queries == ["Berlin"]
+    outage = intake.resolve_city("Tokyo", down.search, "live")
+    assert outage.status == "unavailable" and "Berlin" not in outage.note
+    # Without any geocoder only the fixture city can be planned.
+    assert intake.is_supported_city("Tokyo", None, "live") is False
+
+
+def test_outside_fixture_note_carries_the_callers_live_hint(geo, fake_geocoder):
+    default = intake.resolve_city("Paris", fake_geocoder(geo(**PARIS)).search, "fixture")
+    assert default.note.endswith(intake.SERVE_LIVE_HINT)
+    check = intake.resolve_city("Paris", fake_geocoder(geo(**PARIS)).search, "fixture",
+                                live_hint=intake.RUN_CONFIG_LIVE_HINT)
+    assert check.status == "outside_fixture" and check.note.endswith(intake.RUN_CONFIG_LIVE_HINT)
+    assert 'travel.data-mode="live"' in check.note and "serve_live" not in check.note
+
+
+def test_next_question_explains_city_problems(geo, fake_geocoder):
+    paris = intake.resolve_city("Paris", fake_geocoder(geo(**PARIS)).search, "fixture")
+    assert "Berlin" in intake.next_question(TripBrief(city="Paris"), paris)
+    unknown = intake.resolve_city("Atlantis", fake_geocoder(None).search, "fixture")
+    assert "Atlantis" in intake.next_question(TripBrief(), unknown)
+    assert "Berlin" in intake.next_question(TripBrief(), data_mode="fixture")
+    assert "any city" in intake.next_question(TripBrief(), data_mode="live").lower()
+    assert "date" in intake.next_question(TripBrief(city="Berlin"))
+    assert intake.next_question(TripBrief(**COMPLETE)) is None
+
+
+def test_trip_brief_validates_its_shape():
     with pytest.raises(ValidationError):
         TripBrief(city="Berlin", unknown_field="x")
+    for field, value in (("date", "January 5"), ("start_time", "25:00"), ("end_time", "9am"), ("budget_minor", -1),
+                         ("target_stops", 9), ("transport_mode", "teleport"), ("title", "")):
+        with pytest.raises(ValidationError):
+            TripBrief(**{field: value})
+    assert TripBrief(**COMPLETE).model_dump()["interests"] == ["art", "history"]
+
+
+# --- resolve_request: the AgentApp's one-call form -------------------------------------------------------------
+
+
+def test_resolve_request_plans_berlin_from_the_fixture_without_a_lookup(fake_geocoder):
+    down = fake_geocoder(error=ProviderError("down"))
+    request, reason = intake.resolve_request(TripBrief(**COMPLETE), down, "fixture", TripRequest())
+    assert reason is None and isinstance(request, TripRequest) and down.queries == []
+    assert request.city == "Berlin" and request.timezone == "Europe/Berlin"
+    assert request.start.isoformat() == "2027-01-05T10:00:00+01:00"
+    assert (request.origin.lat, request.origin.lon) == (52.5225, 13.4024)
+    # No geocoder at all is fine for the fixture city.
+    request, reason = intake.resolve_request(TripBrief(**COMPLETE), None, "fixture", TripRequest())
+    assert reason is None and request.city == "Berlin"
+
+
+def test_resolve_request_in_live_mode_takes_everything_from_the_geocoded_place(geo, fake_geocoder):
+    fake = fake_geocoder(geo(**TOKYO))
+    brief = TripBrief(**{**COMPLETE, "city": "tokyo", "interests": ["art", "coffee"]})
+    request, reason = intake.resolve_request(brief, fake, "live", TripRequest())
+    assert reason is None and fake.queries == ["tokyo"]
+    assert request.city == "Tokyo" and request.timezone == "Asia/Tokyo" and request.title == "A day in Tokyo"
+    assert (request.origin.lat, request.origin.lon) == (35.6895, 139.69171) and request.destination == request.origin
+    assert request.start.isoformat() == "2027-01-05T10:00:00+09:00" and request.interests == ["art", "coffee"]
+    # A bare lookup callable is accepted in place of a geocoder object.
+    request, reason = intake.resolve_request(brief, fake.search, "live", TripRequest())
+    assert reason is None and request.city == "Tokyo"
+
+
+def test_resolve_request_layers_the_brief_onto_the_callers_defaults(geo, fake_geocoder):
+    defaults = TripRequest(budget_minor=3000, max_walking_m=2000, target_stops=3, currency="USD")
+    brief = TripBrief(**{**COMPLETE, "city": "Tokyo", "budget_minor": 6000})
+    request, reason = intake.resolve_request(brief, fake_geocoder(geo(**TOKYO)), "live", defaults)
+    assert reason is None
+    assert request.budget_minor == 6000  # the brief wins where it says something
+    assert request.max_walking_m == 2000 and request.target_stops == 3 and request.currency == "USD"
+
+
+def test_resolve_request_explains_an_unsupported_city_in_fixture_mode(geo, fake_geocoder):
+    brief = TripBrief(**{**COMPLETE, "city": "Paris"})
+    request, reason = intake.resolve_request(brief, fake_geocoder(geo(**PARIS)), "fixture", TripRequest())
+    assert request is None
+    assert "Paris, France" in reason and 'travel.data-mode="live"' in reason and "serve_live" not in reason
+    # Without any geocoder the fixture still plans Berlin only, and says how to get live data.
+    request, reason = intake.resolve_request(brief, None, "fixture", TripRequest())
+    assert request is None and "Paris" in reason and "Berlin" in reason and 'travel.data-mode="live"' in reason
+    # A real place inside the fixture radius is planned from the fixture with its own coordinates.
+    inside = TripBrief(**{**COMPLETE, "city": "Kreuzberg"})
+    request, reason = intake.resolve_request(inside, fake_geocoder(geo(**KREUZBERG)), "fixture", TripRequest())
+    assert reason is None and request.city == "Kreuzberg"
+    assert (request.origin.lat, request.origin.lon) == (52.49973, 13.40338)
+
+
+def test_resolve_request_reports_geocode_misses_outages_and_refusals(fake_geocoder):
+    brief = TripBrief(**{**COMPLETE, "city": "Atlantis"})
+    request, reason = intake.resolve_request(brief, fake_geocoder(None), "live", TripRequest())
+    assert request is None and "couldn't find" in reason and "Atlantis" in reason
+    down = fake_geocoder(error=ProviderError("geocoding-api.open-meteo.com request failed (ConnectError)"))
+    request, reason = intake.resolve_request(brief, down, "live", TripRequest())
+    assert request is None and "unavailable" in reason and "ConnectError" not in reason
+    refused = fake_geocoder(error=ValueError("Query contains unsupported characters"))
+    request, reason = intake.resolve_request(brief, refused, "live", TripRequest())
+    assert request is None and reason == "Query contains unsupported characters"
+
+
+def test_resolve_request_never_raises_and_never_returns_a_broken_request(fake_geocoder):
+    request, reason = intake.resolve_request(TripBrief(city="Berlin"), fake_geocoder(), "fixture", TripRequest())
+    assert request is None and "date" in reason  # the next clarifying question
+    overnight = TripBrief(**{**COMPLETE, "start_time": "09:00", "end_time": "08:00"})  # 23 hours
+    request, reason = intake.resolve_request(overnight, fake_geocoder(), "fixture", TripRequest())
+    assert request is None and reason == intake.INVALID_WINDOW_REASON and "18 hours" in reason
+    # Exactly one side is ever None.
+    for brief in (TripBrief(), TripBrief(**COMPLETE), overnight, TripBrief(**{**COMPLETE, "city": "Atlantis"})):
+        request, reason = intake.resolve_request(brief, None, "fixture", TripRequest())
+        assert (request is None) != (reason is None)
+
+
+def test_fill_default_window_is_opt_in_and_lets_the_sample_prompt_plan_in_one_turn(geo, fake_geocoder):
+    brief = intake.parse("Plan a day in Tokyo tomorrow, art and coffee, budget 60", TripBrief(), now=NOW)
+    assert intake.missing_fields(brief) == ["time_window"]
+    filled = intake.fill_default_window(brief, TripRequest())
+    assert (filled.start_time, filled.end_time) == ("10:00", "17:00") and intake.missing_fields(filled) == []
+    assert brief.start_time is None  # the input is untouched
+    half = TripBrief(start_time="09:00")
+    assert intake.fill_default_window(half, TripRequest()) is half  # a half-stated window is still asked about
+    full = TripBrief(start_time="09:00", end_time="12:00")
+    assert intake.fill_default_window(full, TripRequest()) is full
+    request, reason = intake.resolve_request(filled, fake_geocoder(geo(**TOKYO)), "live", TripRequest())
+    assert reason is None and request.city == "Tokyo" and request.budget_minor == 6000
+    assert request.start.isoformat() == "2026-09-17T10:00:00+09:00"
+    assert request.end.isoformat() == "2026-09-17T17:00:00+09:00" and request.interests == ["art", "coffee"]

@@ -11,36 +11,37 @@
 <body>
   <header class="topbar">
     <a class="brand" href="/" aria-label="OSM Travel Companion home"><span class="brand-icon" aria-hidden="true">✳</span><span>Travel Companion<small>OPENSTREETMAP + FLOWER</small></span></a>
-    <nav aria-label="Workspace"><span class="nav-active">Itinerary workspace</span><a href="/docs" target="_blank" rel="noopener">API</a><button class="text-button" id="new-trip">New trip</button></nav>
+    <nav aria-label="Workspace"><span class="nav-active">Itinerary workspace</span><a href="/docs" target="_blank" rel="noopener">API</a><button class="text-button" id="new-trip" title="Forget the saved trip and start again">New trip</button></nav>
     <div class="mode-pill" id="mode-pill"><span class="status-dot"></span>Loading configuration</div>
   </header>
   <div class="notice-bar" id="notice-bar">Synthetic demonstration data. No bookings or payments are made.</div>
   <main class="workspace">
     <div class="thread">
       <section class="bubble chat-intake" id="chat-intake">
-        <div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">TELL ME ABOUT YOUR TRIP</div><h1>Let's plan your day.</h1></div></div>
-        <p class="subtle intro">Describe your trip in plain language — I'll fill in the details as we go.</p>
+        <div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">TELL ME ABOUT YOUR DAY</div><h1>Let's plan your day.</h1></div></div>
+        <p class="subtle intro">Describe one day in plain language: city, date, hours and interests. I fill in the trip details below as we go; you can always edit them directly.</p>
         <div class="chat-log" id="chat-log" aria-live="polite"></div>
         <form id="chat-form">
           <label class="sr-only" for="chat-input">Message</label>
           <div class="input-row chat-input-row">
-            <input id="chat-input" type="text" maxlength="600" placeholder="e.g. Two days in Berlin next Friday, mostly art and coffee" autocomplete="off">
-            <button class="primary" type="submit" id="chat-send">Send</button>
+            <input id="chat-input" type="text" maxlength="600" placeholder="e.g. Berlin next Friday, 10 to 5, art and coffee" autocomplete="off">
+            <button class="send-button" type="submit" id="chat-send">Send</button>
           </div>
         </form>
-        <p class="micro" id="chat-note"></p>
+        <p class="micro" id="chat-note" aria-live="polite"></p>
       </section>
 
       <section class="bubble preferences">
-        <div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">YOUR DAY, YOUR CONSTRAINTS</div><h1>Make room for the day.</h1></div></div>
-        <p class="subtle intro">One itinerary. Four specialists. Every change is yours to review.</p>
+        <div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">OR SET THE DETAILS YOURSELF</div><h1>Trip details, your way.</h1></div></div>
+        <p class="subtle intro">Whatever you tell the chat lands in this form. Edit any field and build; after the first plan, every change comes back as a revision for you to review.</p>
         <details id="details-panel" open>
-          <summary>Trip details</summary>
+          <summary>Trip details <span class="details-meta" id="details-meta"></span></summary>
           <form id="trip-form">
             <label>Trip name<input id="trip-title" value="A day in Berlin" maxlength="120" required></label>
-            <div class="input-row"><label>City<input id="city" value="Berlin" required></label><label>Date<input id="trip-date" type="date" required></label></div>
+            <div class="city-field"><label for="city">City</label><div class="city-row"><input id="city" value="Berlin" autocomplete="off" required><button type="button" id="locate-button" class="small-button" title="Find this city and move the start and finish there">Locate</button></div></div>
+            <p class="micro city-status" id="city-status" aria-live="polite">Type a city and press Locate to move the start and finish.</p>
+            <div class="input-row"><label>Date<input id="trip-date" type="date" required></label><label>Timezone<input id="timezone" value="Europe/Berlin" required></label></div>
             <div class="input-row"><label>From<input id="start-time" type="time" value="10:00" required></label><label>Until<input id="end-time" type="time" value="17:00" required></label></div>
-            <label>Timezone<input id="timezone" value="Europe/Berlin" required></label>
             <div class="section-rule"></div>
             <div class="label-row"><label for="budget">Budget</label><span id="budget-label">EUR 60</span></div>
             <input id="budget" type="range" min="0" max="150" value="60" step="5">
@@ -51,11 +52,11 @@
             <div class="section-rule"></div>
             <label class="check-label"><input type="checkbox" id="avoid-rain" checked><span>Avoid outdoor visits in rain</span></label>
             <p class="micro">Rain threshold: 60%. Travel between indoor stops may still be outdoors.</p>
-            <button class="primary wide" type="submit" id="build-button">Build itinerary <span aria-hidden="true">↗</span></button>
-            <p class="micro" id="engine-note">Local fixture replay uses deterministic specialist policies. Model calls: 0.</p>
           </form>
-          <div class="endpoint-box"><div class="eyebrow">MAP SELECTION</div><p id="endpoint-text">Start and finish: Hackescher Markt</p><div class="button-pair"><button id="set-start" class="small-button">Set start</button><button id="set-end" class="small-button">Set finish</button></div></div>
+          <div class="endpoint-box"><div class="eyebrow">MAP SELECTION</div><p id="endpoint-text">Start and finish: Hackescher Markt</p><div class="button-pair"><button id="set-start" class="small-button" type="button">Set start</button><button id="set-end" class="small-button" type="button">Set finish</button></div></div>
         </details>
+        <button class="primary wide" type="submit" form="trip-form" id="build-button"><span id="build-label">Build itinerary</span> <span aria-hidden="true">↗</span></button>
+        <p class="micro" id="engine-note">Local fixture replay uses deterministic specialist policies. Model calls: 0.</p>
       </section>
 
       <section class="bubble flower-panel" id="flower-panel" hidden>
@@ -63,18 +64,18 @@
         <p class="micro" id="flower-note">Submitting the job as a Flower AgentApp run.</p>
         <div class="run-metrics" id="flower-run" hidden></div>
         <pre id="flower-command" hidden></pre>
-        <button id="copy-command" class="small-button" hidden>Copy command</button>
+        <button id="copy-command" class="small-button" type="button" hidden>Copy command</button>
       </section>
 
       <section class="bubble collaboration-panel">
-        <div class="panel-heading"><div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">SHARED ITINERARY STATE</div><h2>Agent collaboration</h2></div></div><span class="live-indicator" id="job-state">Ready</span></div>
-        <p class="subtle small">Specialists exchange structured findings. Application code checks the schedule.</p>
+        <div class="panel-heading"><div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">WHAT THE SPECIALISTS DID</div><h2>Agent collaboration</h2></div></div><span class="live-indicator" id="job-state" aria-live="polite">Ready</span></div>
+        <p class="subtle small">Four specialists rank places, weather, routes and budget and pass requests to each other. The app builds the schedule from their findings and checks every constraint itself.</p>
         <div class="agent-list" id="agent-list"></div>
         <div class="run-metrics" id="run-metrics">No planning run yet.</div>
         <div class="event-feed" id="event-feed" aria-live="polite"><p class="micro">Execution events and inter-agent requests will appear during planning.</p></div>
       </section>
 
-      <section class="bubble main-column">
+      <section class="bubble main-column" id="itinerary-panel">
         <div class="panel-heading"><div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">THE ITINERARY</div><h2 id="itinerary-title">Explore Berlin, together.</h2></div></div><span class="revision-badge" id="revision">DRAFT</span></div>
         <div class="metrics" id="metrics">
           <div><span>PLANNED STOPS</span><strong id="metric-stops">0</strong></div>
@@ -82,10 +83,10 @@
           <div><span>ACCOUNTED COST</span><strong id="metric-cost">0 <small>EUR</small></strong></div>
           <div><span>FINISH BY</span><strong id="metric-end">17:00</strong></div>
         </div>
-        <div class="scenario-bar"><div><span class="eyebrow">ADAPT THE PLAN</span><small>Explicit changes, inspectable revisions.</small></div><button class="scenario-button" id="rain" disabled>☂ Simulate rain</button><button class="scenario-button" id="less-walking" disabled>Reduce walking</button><button class="scenario-button" id="refresh" disabled>Refresh conditions</button></div>
-        <div class="section-heading timeline-heading"><h2>Your timeline</h2><div><button class="text-button" id="import-button">Import JSON</button><button class="text-button" id="export-button" disabled>Export JSON</button></div></div>
+        <div class="scenario-bar"><div class="scenario-intro"><span class="eyebrow">ADAPT THE PLAN</span><small id="scenario-hint">Build an itinerary first. Scenarios then propose reviewed revisions.</small></div><div class="scenario-buttons"><button class="scenario-button" id="rain" type="button" disabled title="Replay the day under a simulated rain forecast">☂ Simulate rain</button><button class="scenario-button" id="less-walking" type="button" disabled title="Ask for a plan with about 40% less walking">Reduce walking</button><button class="scenario-button" id="refresh" type="button" disabled title="Re-read weather and opening conditions">Refresh conditions</button></div></div>
+        <div class="section-heading timeline-heading"><h2 id="timeline-title">Your timeline</h2><div><button class="text-button" id="import-button" type="button">Import JSON</button><button class="text-button" id="export-button" type="button" disabled>Export JSON</button></div></div>
         <input id="import-file" type="file" accept="application/json" hidden>
-        <div class="timeline" id="timeline"><div class="empty-timeline"><div class="empty-icon">◎</div><h3>A day with a clear plan.</h3><p>Set your preferences and build an itinerary.<br>The specialists will share findings here.</p></div></div>
+        <div class="timeline" id="timeline"><div class="empty-timeline"><div class="empty-icon">◎</div><h3>A day with a clear plan.</h3><p>Describe your day above or set the trip details, then build an itinerary.<br>The specialists will share findings here.</p></div></div>
       </section>
 
       <section class="bubble review-panel" id="review-panel">
@@ -98,15 +99,14 @@
 
     <aside class="map-column">
       <div class="map-shell">
-        <div class="map-top"><span class="map-label" id="map-label">COORDINATE SCHEMATIC</span><button id="load-osm" class="small-button">Load OSM map</button></div>
-        <div class="day-tabs" id="day-tabs" hidden></div>
+        <div class="map-top"><span class="map-label" id="map-label">COORDINATE SCHEMATIC</span><button id="load-osm" class="small-button" type="button" title="Show OpenStreetMap tiles under the places and routes">Load street map</button></div>
         <div id="map" role="region" aria-label="Itinerary map"><svg id="schematic" viewBox="0 0 900 590" aria-label="Offline coordinate schematic"></svg></div>
         <div class="map-bottom"><span id="route-label">Create a trip to display places and routes.</span><span>Geographic view <span aria-hidden="true">↗</span></span></div>
-        <div class="map-selection" id="map-selection" hidden>Click the map to choose a location. <button id="cancel-selection">Cancel</button></div>
+        <div class="map-selection" id="map-selection" hidden>Click the map to choose a location. <button id="cancel-selection" type="button">Cancel</button></div>
       </div>
     </aside>
   </main>
-  <dialog id="details-dialog"><button class="dialog-close" id="close-details" aria-label="Close details">×</button><div id="details-content"></div></dialog>
+  <dialog id="details-dialog"><button class="dialog-close" id="close-details" type="button" aria-label="Close details">×</button><div id="details-content"></div></dialog>
   <dialog id="login-dialog"><h2>Workspace access</h2><p>Enter the API token configured on this server.</p><form id="login-form"><label>API token<input id="login-token" type="password" autocomplete="current-password" required></label><button class="primary" type="submit">Continue</button></form><p id="login-error" class="error-text"></p></dialog>
   <div id="toast" class="toast" role="status" hidden></div>
 </body>

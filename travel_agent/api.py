@@ -6,34 +6,41 @@ import json
 import os
 import secrets
 import shlex
+import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import urlparse
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from travel_agent import intake
 from travel_agent.agents import ExecutionBudget, ModelRunner, RulesRunner, openai_client
 from travel_agent.coordinator import Coordinator, apply_event
 from travel_agent.flower_backend import FlowerBackend
-from travel_agent.providers.services import ProviderError, make_provider
-from travel_agent.schemas import (
-    Contract,
-    IntakeTurn,
-    Proposal,
-    TripBrief,
-    TripEvent,
-    TripRequest,
-    TripSnapshot,
+from travel_agent.providers.services import (
+    ProviderError,
+    fixture_supported,
+    make_geocoder,
+    make_provider,
+    resolve_router,
 )
+from travel_agent.schemas import Contract, IntakeTurn, Proposal, TripEvent, TripRequest, TripSnapshot
+from travel_agent.settings import ModelSettings, effective_model_calls, model_settings_from_env
 from travel_agent.store import Conflict, NotFound, Store
 
 WEB = Path(__file__).parent / "web"
+
+
+class Geocodes(Protocol):
+    """What the API needs from a geocoder: `search(query)` returning a GeoPlace or None."""
+    def search(self, query: str): ...
 
 
 class CreateTrip(Contract):
@@ -52,7 +59,8 @@ class WorkerEvent(Contract):
 
 def create_app(db_path: str | None = None, *, data_mode: str | None = None,
                agent_mode: str | None = None, execution_backend: str | None = None,
-               flower_backend: FlowerBackend | None = None, intake_client=None) -> FastAPI:
+               flower_backend: FlowerBackend | None = None, geocoder: Geocodes | None = None,
+               intake_client=None) -> FastAPI:
     store = Store(db_path or os.getenv("TRAVEL_DB", "runtime/travel.sqlite3"))
     data_mode = data_mode or os.getenv("TRAVEL_DATA_MODE", "fixture")
     agent_mode = agent_mode or os.getenv("TRAVEL_AGENT_MODE", "rules")
@@ -73,15 +81,64 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
             raise ValueError("SuperGrid workers plan on bundled fixture data; live providers are configured locally only")
         flower = flower_backend or FlowerBackend.from_env()
     bridge = backend == "flower" and flower is None
-    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trip-worker")
+    # Local model path: one set of bounded model settings, read once so /api/config and every job agree.
+    settings: ModelSettings | None = model_settings_from_env() if backend == "local" and agent_mode == "model" else None
+    # Live data: resolve the router the way make_provider does so /api/config reports what a job will use, and
+    # build the provider now on the local backend so a bad TRAVEL_ROUTER or endpoint fails at startup, not mid-job.
     provider = None
+    router = resolve_router() if data_mode == "live" else None
+    if data_mode == "live" and backend == "local":
+        try:
+            provider = make_provider(data_mode)
+        except (ProviderError, ValueError) as exc:
+            raise ValueError(f"Live data providers are misconfigured: {exc}") from exc
+        if getattr(provider, "router", None) in ("osrm", "ors"):
+            router = provider.router
+    router_label = {"osrm": "OSRM", "ors": "OpenRouteService"}.get(router, router or "the configured router")
+    live_notice = ("Live OpenStreetMap data. Prices and hours stay unknown unless OSM tags verify them; "
+                   f"routes via {router_label}.")
+    pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="trip-worker")
+    geocoder_lock = threading.Lock()
+
+    def get_geocoder() -> Geocodes:
+        """The injected geocoder, or one built from the environment on first use (never at startup)."""
+        nonlocal geocoder
+        with geocoder_lock:
+            if geocoder is None:
+                geocoder = make_geocoder()
+            return geocoder
+
+    intake_lock = threading.Lock()
+    intake_state: dict = {"client": intake_client, "built": intake_client is not None}
+
+    def get_intake_client():
+        """The injected intake model client, or one built once from the local model settings; None = rules only.
+
+        The SuperGrid backend has no model endpoint on this machine, so the intake stays rules-based there.
+        """
+        with intake_lock:
+            if not intake_state["built"]:
+                intake_state["built"] = True
+                if settings is not None:
+                    try:
+                        intake_state["client"] = openai_client(os.getenv("TRAVEL_MODEL_BASE_URL", ""),
+                                                               os.getenv("TRAVEL_MODEL_API_KEY", ""),
+                                                               intake.MODEL_TIMEOUT_S, settings.api)
+                    except (ValueError, RuntimeError) as exc:
+                        print(f"[intake] model enrichment disabled: {exc}", file=sys.stderr, flush=True)
+            return intake_state["client"]
+
+    def model_settings_view() -> dict | None:
+        """The active path's model settings: the SuperGrid backend's, the local model's, or none for rules."""
+        active = getattr(flower, "settings", None) if flower is not None else settings
+        return active.describe() if isinstance(active, ModelSettings) else None
 
     @asynccontextmanager
     async def lifespan(app):
         yield
         pool.shutdown(wait=True)
 
-    app = FastAPI(title="OSM Travel Companion", version="0.2.0", lifespan=lifespan)
+    app = FastAPI(title="OSM Travel Companion", version="0.3.2", lifespan=lifespan)
     app.state.store = store
 
     @app.exception_handler(Conflict)
@@ -125,7 +182,7 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "version": "0.2.0"}
+        return {"status": "ok", "version": "0.3.2"}
 
     @app.get("/api/config")
     def config():
@@ -135,8 +192,11 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
                 "tile_url": os.getenv("TRAVEL_TILE_URL", "https://tile.openstreetmap.org/{z}/{x}/{y}.png"),
                 "default_request": TripRequest().model_dump(mode="json"),
                 "fixture_notice": "Synthetic Berlin scenario. Prices, hours, weather and direct-line routes are unverified fixtures.",
-                "model": flower.model if flower else (os.getenv("TRAVEL_MODEL", "") or None) if agent_mode == "model" else None,
-                "supported_cities": sorted(intake.SUPPORTED_CITIES.values())}
+                "live_notice": live_notice, "geocoding": True, "router": router,
+                "model": flower.model if flower else settings.model if settings else None,
+                "model_api": settings.api if settings else None,
+                "model_settings": model_settings_view(), "intake": True,
+                "supported_cities": [intake.FIXTURE_CITY] if data_mode == "fixture" else None}
 
     @app.post("/api/login")
     async def login(request: Request):
@@ -147,6 +207,72 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
         response.set_cookie("travel_session", token, httponly=True, secure=request.url.scheme == "https",
                             samesite="strict", max_age=8 * 3600)
         return response
+
+    @app.get("/api/geocode")
+    def geocode(q: str = ""):
+        """Resolve a typed place name to coordinates and a timezone. No match is a 404, never a guessed location."""
+        text = q.strip()
+        if not 2 <= len(text) <= 80:
+            raise HTTPException(400, "Enter a place name of 2 to 80 characters")
+        try:
+            place = get_geocoder().search(text)
+        except ProviderError:
+            raise HTTPException(503, "Geocoding service unavailable") from None
+        except ValidationError as exc:
+            # A malformed upstream record is a provider fault, not a client error; its text stays in the server log.
+            print(f"[geocode] unusable result for {text!r}: {str(exc)[:500]}", file=sys.stderr, flush=True)
+            raise HTTPException(503, "Geocoding service unavailable") from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)[:200]) from None
+        if place is None:
+            raise HTTPException(404, "No place matched that name")
+        return {"query": place.query, "name": place.name, "country": place.country, "admin1": place.admin1,
+                "lat": place.coordinate.lat, "lon": place.coordinate.lon, "timezone": place.timezone,
+                "population": place.population, "fixture_supported": fixture_supported(place.coordinate),
+                "source": {"provider": place.source.provider, "status": place.source.status}}
+
+    @app.post("/api/intake")
+    def intake_turn(body: IntakeTurn):
+        """One conversational turn: parse the message onto the brief, check the city, ask for what is missing.
+
+        The rules parser always runs; in local model mode the model may fill more of the brief and `engine`
+        reports whether it contributed. `ready` with a `request` means the brief can be posted to /api/trips.
+        """
+        brief = intake.parse(body.message, body.brief)
+        engine = "rules"
+        client = get_intake_client()
+        if client is not None:
+            model_name = settings.model if settings is not None else os.getenv("TRAVEL_MODEL", "").strip()
+            enriched = intake.enrich_with_model(body.message, body.brief, body.history, client, model_name,
+                                                timeout_s=intake.MODEL_TIMEOUT_S)
+            if enriched is not None:
+                brief, contributed = intake.merge_briefs(brief, enriched)
+                engine = "model" if contributed else engine
+        notes: list[str] = []
+        days = intake.multi_day_mention(body.message)
+        if days:
+            notes.append(f"This planner builds one day at a time, so I will plan a single day of your {days}-day trip.")
+        check = intake.resolve_city(brief.city, lambda name: get_geocoder().search(name), data_mode)
+        if check.status == "unresolved":
+            brief = brief.model_copy(update={"city": None})  # an unknown name is not a usable answer
+        elif check.place is not None and check.place.name != brief.city:
+            brief = brief.model_copy(update={"city": check.place.name})  # the geocoder's canonical spelling
+        if check.note:
+            notes.append(check.note)
+        missing = intake.missing_fields(brief)
+        ready, request = False, None
+        if check.supported and not missing:
+            request = intake.to_trip_request(brief, TripRequest(), check.place)
+            ready = request is not None
+            reply = (f"Great, I have everything I need. Building your day in {request.city} now." if ready else
+                     intake.INVALID_WINDOW_REASON)
+        elif not missing and check.status == "unavailable":
+            reply = (f"I have everything except a confirmed location for {brief.city}. Send any message to retry "
+                     "the lookup, or name another city.")
+        else:
+            reply = intake.next_question(brief, check, data_mode=data_mode) or ""
+        return {"reply": reply, "brief": brief.model_dump(mode="json"), "missing": missing, "ready": ready,
+                "request": request.model_dump(mode="json") if request else None, "engine": engine, "notes": notes}
 
     def execute(job_id: str):
         nonlocal provider
@@ -165,28 +291,37 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
                 # SuperGrid executes the specialists; the result is validated again by store.finish_job.
                 proposal = flower.run_job(snapshot, event, emit)
             else:
-                if agent_mode == "model":
+                if settings is not None:
+                    budget = ExecutionBudget(wall_time_s=settings.wall_time_s, max_model_calls=effective_model_calls(
+                        settings.max_model_calls, settings.max_tool_turns))
                     client = openai_client(os.getenv("TRAVEL_MODEL_BASE_URL", ""), os.getenv("TRAVEL_MODEL_API_KEY", ""),
-                                           float(os.getenv("TRAVEL_MODEL_TIMEOUT_S", "120")))
-                    runner = ModelRunner(client, os.getenv("TRAVEL_MODEL", ""), emit, budget,
-                                         int(os.getenv("TRAVEL_MAX_TOOL_TURNS", "2")))
+                                           settings.model_timeout_s, settings.api)
+                    runner = ModelRunner(client, settings.model, emit, budget, settings.max_tool_turns,
+                                         settings.reasoning_effort, max_output_tokens=settings.max_output_tokens)
                 else:
                     runner = RulesRunner(emit, budget)
                 if provider is None:
                     provider = make_provider(data_mode)
                 proposal = Coordinator(provider, runner, emit, budget).plan(snapshot, event)
+            store.finish_job(job_id, proposal)
             # Clicking Create trip authorizes the initial itinerary. Every later revision requires review.
-            auto_accept = snapshot.revision == 0 and event is None
-            store.finish_job(job_id, proposal, auto_accept=auto_accept)
-            emit("job.finished", {"job_id": job_id, "proposal_id": proposal.id, "metrics": metrics or budget.metrics()})
+            if snapshot.revision == 0 and event is None and proposal.proposed.itinerary.validation.valid:
+                store.accept(proposal.id)
+            # SuperGrid runs report the AgentApp's budget; local runs report their own. Every kind is always present.
+            usage = {"model_calls": 0, "tool_calls": 0, "provider_calls": 0, **(metrics or budget.metrics())}
+            emit("job.finished", {"job_id": job_id, "proposal_id": proposal.id, "metrics": usage})
         except Exception as exc:
-            # Do not expose provider credentials or arbitrary model response text.
+            # Do not expose provider credentials or arbitrary model response text to API clients.
             allowed = isinstance(exc, (ValueError, Conflict, ProviderError, RuntimeError))
             message = str(exc)[:350] if allowed else type(exc).__name__ + ": inspect server logs locally"
+            detail = f"{type(exc).__name__}: {str(exc)[:1500]}"
             for secret_name in ("TRAVEL_MODEL_API_KEY", "ORS_API_KEY", "TRAVEL_API_TOKEN"):
                 value = os.getenv(secret_name, "")
                 if value:
                     message = message.replace(value, "[redacted]")
+                    detail = detail.replace(value, "[redacted]")
+            # The full, redacted cause goes to the server log only; the client sees the short message.
+            print(f"[job {job_id}] failed: {detail}", file=sys.stderr, flush=True)
             store.fail_job(job_id, message)
 
     def queue(snapshot, event=None):
@@ -211,57 +346,6 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
         job = queue(snapshot)
         return {"trip_id": snapshot.id, "job": job}
 
-    def _intake_model_client():
-        if intake_client is not None:
-            return intake_client
-        if agent_mode != "model":
-            return None
-        try:
-            return openai_client(os.getenv("TRAVEL_MODEL_BASE_URL", ""), os.getenv("TRAVEL_MODEL_API_KEY", ""), 20.0)
-        except Exception:
-            return None
-
-    @app.post("/api/intake")
-    def intake_turn(body: IntakeTurn):
-        brief = intake.parse(body.message, body.brief)
-        engine = "rules"
-        client = _intake_model_client()
-        if client is not None:
-            model_brief = intake.enrich_with_model(
-                body.message, body.brief, body.history, client, os.getenv("TRAVEL_MODEL", ""), timeout_s=20)
-            if model_brief is not None:
-                # Merge policy: field-by-field, prefer the model's non-null/non-empty value
-                # (it merged onto the pre-turn brief already, so it reflects both prior state
-                # and the new message); fall back to the rules parser's value otherwise. The
-                # rules parser remains the floor whenever the model omits or fails a field.
-                rules_data = brief.model_dump()
-                model_data = model_brief.model_dump()
-                merged = dict(rules_data)
-                contributed = False
-                for key, value in model_data.items():
-                    if value not in (None, [], "") and merged.get(key) != value:
-                        merged[key] = value
-                        contributed = True
-                brief = TripBrief(**merged)
-                if contributed:
-                    engine = "model"
-        missing = intake.missing_fields(brief)
-        notes: list[str] = []
-        ready = False
-        request = None
-        if brief.city and not intake.is_supported_city(brief.city):
-            notes.append(f"'{brief.city}' isn't supported yet — only Berlin is available right now.")
-            reply = intake.next_question(brief) or ""
-        elif not missing:
-            request = intake.to_trip_request(brief, TripRequest())
-            ready = request is not None
-            reply = ("Great — I have everything I need. Building your itinerary now."
-                     if ready else "Something about that trip doesn't quite work yet — could you clarify?")
-        else:
-            reply = intake.next_question(brief) or ""
-        return {"reply": reply, "brief": brief.model_dump(mode="json"), "missing": missing, "ready": ready,
-                "request": request.model_dump(mode="json") if request else None, "engine": engine, "notes": notes}
-
     @app.get("/api/trips")
     def list_trips():
         return store.trip_list()
@@ -278,11 +362,10 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
 
     @app.post("/api/trips/import")
     def import_trip(body: TripSnapshot):
-        from travel_agent.planning.engine import validate_trip
-        stop_cap = 8 * body.request.days
-        if len(body.places) > 24 * body.request.days or (body.itinerary and len(body.itinerary.stops) > stop_cap):
+        from travel_agent.planning.engine import validate
+        if len(body.places) > 24 or body.itinerary and len(body.itinerary.stops) > 8:
             raise HTTPException(400, "Imported itinerary exceeds the MVP limits")
-        if body.itinerary and not validate_trip(body, body.itinerary).valid:
+        if body.itinerary and not validate(body, body.itinerary).valid:
             raise HTTPException(400, "Imported itinerary failed validation")
         body.id = uuid4().hex
         store.create_trip(body)
@@ -354,9 +437,10 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
     @app.post("/internal/jobs/{job_id}/result")
     def worker_result(job_id: str, request: Request, body: Proposal):
         store.verify_worker(job_id, worker_token(request))
+        store.finish_job(job_id, body)
         payload = store.job_input(job_id)
-        auto_accept = body.base_revision == 0 and payload["event"] is None
-        store.finish_job(job_id, body, auto_accept=auto_accept)
+        if body.base_revision == 0 and payload["event"] is None and body.proposed.itinerary.validation.valid:
+            store.accept(body.id)
         store.append_event(job_id, "job.finished", {"job_id": job_id, "proposal_id": body.id})
         return {"ok": True}
 

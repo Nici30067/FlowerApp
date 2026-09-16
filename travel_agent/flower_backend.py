@@ -10,15 +10,21 @@ import hashlib
 import json
 import os
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import replace
 from pathlib import Path
 
 from travel_agent import jobcodec
 from travel_agent.schemas import Proposal, TripEvent, TripSnapshot
+from travel_agent.settings import DEFAULT_MODEL, ModelSettings, model_settings_from_env
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL = "flower-endeavor-v1.0"
 Listener = Callable[[str, dict], None]
+STREAM_RETRY_DELAYS_S = (2, 4, 6)
+RUN_TIMEOUT_MARGIN_S = 300  # default headroom over the AgentApp's own wall-time budget
+RUN_TIMEOUT_FLOOR_S = 60  # the local stop must never fire before the AgentApp's budget can
+_sleep = time.sleep  # replaced in tests
 
 
 class FlowerError(RuntimeError):
@@ -43,36 +49,61 @@ def _payload(task_event) -> tuple[str, dict]:
     return task_event.event or str(data.get("type", "")), data
 
 
+def run_id_from(response) -> int:
+    """The run ID of a StartRun response. Without one, SuperGrid's note (for example: no credits) is surfaced."""
+    if response.HasField("run_id"):
+        return int(response.run_id)
+    note = (response.note if response.HasField("note") else "").strip() or "no reason was given"
+    raise FlowerError(f"SuperGrid did not start a run: {note}")
+
+
 class FlowerBackend:
     """Runs one planning job per SuperGrid run and relays the specialist events to a listener."""
 
-    def __init__(self, *, connection: str = "supergrid", federation: str = "", model: str = DEFAULT_MODEL,
-                 max_tool_turns: int = 0, model_timeout_s: float = 120, run_timeout_s: float = 900,
-                 reasoning_effort: str = "low", project_dir: Path = PROJECT_DIR):
-        if not model.strip():
+    def __init__(self, *, connection: str = "supergrid", federation: str = "", settings: ModelSettings | None = None,
+                 run_timeout_s: float | None = None, project_dir: Path = PROJECT_DIR, **overrides):
+        """`overrides` are ModelSettings fields (model, max_tool_turns, ...) applied on top of `settings`."""
+        settings = replace(settings or ModelSettings(), **overrides)
+        if not settings.model.strip():
             raise ValueError("Set TRAVEL_MODEL to the runtime model ID")
         if federation and not federation.startswith("@"):
             raise ValueError("A Flower federation ID looks like @account/federation")
-        self.connection, self.federation, self.model = connection, federation, model.strip()
-        self.max_tool_turns, self.model_timeout_s, self.run_timeout_s = int(max_tool_turns), float(model_timeout_s), float(run_timeout_s)
-        self.reasoning_effort = reasoning_effort
+        self.connection, self.federation = connection, federation
+        self.settings = replace(settings, model=settings.model.strip())
+        # The AgentApp enforces wall_time_s itself and reports a clean failure; the local stop is only a backstop.
+        requested = float(run_timeout_s) if run_timeout_s is not None else settings.wall_time_s + RUN_TIMEOUT_MARGIN_S
+        self.run_timeout_s = max(requested, float(settings.wall_time_s + RUN_TIMEOUT_FLOOR_S))
         self.project_dir = Path(project_dir)
         self._lock = threading.Lock()
         self._fab: tuple[str, bytes, float] | None = None
 
     @classmethod
     def from_env(cls) -> FlowerBackend:
+        raw_timeout = os.getenv("TRAVEL_FLOWER_RUN_TIMEOUT_S", "").strip()
         return cls(connection=os.getenv("TRAVEL_FLOWER_CONNECTION", "supergrid"),
                    federation=os.getenv("TRAVEL_FLOWER_FEDERATION", ""),
-                   model=os.getenv("TRAVEL_MODEL", "") or DEFAULT_MODEL,
-                   max_tool_turns=int(os.getenv("TRAVEL_MAX_TOOL_TURNS", "0")),
-                   model_timeout_s=float(os.getenv("TRAVEL_MODEL_TIMEOUT_S", "120")),
-                   run_timeout_s=float(os.getenv("TRAVEL_FLOWER_RUN_TIMEOUT_S", "900")),
-                   reasoning_effort=os.getenv("TRAVEL_REASONING_EFFORT", "low"))
+                   settings=model_settings_from_env(DEFAULT_MODEL),
+                   run_timeout_s=float(raw_timeout) if raw_timeout else None)
+
+    @property
+    def model(self) -> str:
+        return self.settings.model
+
+    @property
+    def max_tool_turns(self) -> int:
+        return self.settings.max_tool_turns
+
+    @property
+    def model_timeout_s(self) -> float:
+        return self.settings.model_timeout_s
+
+    @property
+    def reasoning_effort(self) -> str:
+        return self.settings.reasoning_effort
 
     def describe(self) -> dict:
         return {"connection": self.connection, "federation": self.federation or "account default", "model": self.model,
-                "max_tool_turns": self.max_tool_turns, "reasoning_effort": self.reasoning_effort}
+                "run_timeout_s": self.run_timeout_s, **self.settings.describe()}
 
     # --- Flower App Bundle -------------------------------------------------------------------------------
     def _source_stamp(self) -> float:
@@ -94,31 +125,118 @@ class FlowerBackend:
 
     # --- Control API ---------------------------------------------------------------------------------------
     def _client(self):
+        import click
         from flwr.cli.flower_config import read_superlink_connection
         from flwr.cli.utils import init_http_client_from_connection
-        connection = read_superlink_connection(self.connection)
-        if not connection.address:
-            raise FlowerError(f"The Flower connection '{self.connection}' has no address")
-        return init_http_client_from_connection(connection)
+        try:
+            connection = read_superlink_connection(self.connection)
+            if not connection.address:
+                raise FlowerError(f"The Flower connection '{self.connection}' has no address")
+            return init_http_client_from_connection(connection)
+        except click.ClickException as exc:
+            raise FlowerError(f"Flower connection '{self.connection}' is not usable: {exc.format_message()}") from None
 
     def _overrides(self, job: str, data_mode: str) -> dict:
-        return {"agent.input": json.dumps({"job": job}), "agent.model": self.model,
-                "agent.max-tool-turns": self.max_tool_turns, "agent.model-timeout-s": self.model_timeout_s,
-                "agent.reasoning-effort": self.reasoning_effort, "travel.data-mode": data_mode}
+        """Run-config overrides. Every key must exist under [tool.flwr.app.config] in pyproject.toml."""
+        s = self.settings
+        return {"agent.input": json.dumps({"job": job}), "agent.model": s.model,
+                "agent.max-tool-turns": s.max_tool_turns, "agent.model-timeout-s": s.model_timeout_s,
+                "agent.reasoning-effort": s.reasoning_effort, "agent.max-model-calls": s.model_call_cap,
+                "agent.wall-time-s": s.wall_time_s, "agent.max-output-tokens": s.max_output_tokens,
+                "travel.data-mode": data_mode}
+
+    @staticmethod
+    def _stop_run(client, run_id: int) -> str:
+        """Ask SuperGrid to stop a run. Never raises: the caller is already reporting a failure."""
+        import click
+        from flwr.cli.utils import flwr_cli_exc_handler
+        from flwr.proto.control_pb2 import StopRunRequest
+        try:
+            with flwr_cli_exc_handler():
+                response = client.StopRun(StopRunRequest(run_id=run_id))
+            return "the run was stopped" if response.success else "SuperGrid declined to stop the run"
+        except click.ClickException as exc:
+            return f"stopping the run failed: {exc.format_message()}"
+        except Exception as exc:
+            return f"stopping the run failed: {type(exc).__name__}"
+
+    @staticmethod
+    def relay_stream(open_stream: Callable[[int | None], Iterable], listen: Listener, outcome: dict,
+                     deadline: float, stop: threading.Event) -> None:
+        """Consume run events until the AgentApp reports a result or failure, or the stream ends.
+
+        `open_stream(after_task_event_id)` returns an iterable of StreamRunEvents responses. A listener failure is
+        counted in `outcome["listener_errors"]` and never ends the run. A transport failure reconnects after the last
+        relayed task event (2s, 4s, 6s) while the deadline allows; the final exception is left in `outcome["error"]`.
+        """
+        outcome.update({"relayed": 0, "listener_errors": 0, "reconnects": 0})
+        last_id: int | None = None
+
+        def relay(kind: str, data: dict) -> None:
+            try:
+                listen(kind, data)
+            except Exception:  # The store or UI listener must not take the SuperGrid run down with it.
+                outcome["listener_errors"] += 1
+
+        attempt = 0
+        while not stop.is_set():
+            try:
+                for item in open_stream(last_id):
+                    task_event = item.task_event
+                    last_id = int(task_event.id)
+                    outcome["relayed"] += 1
+                    kind, data = _payload(task_event)
+                    if kind == "travel.result":
+                        outcome["result"] = data
+                        return
+                    if kind == "travel.failed":
+                        outcome["failure"] = str(data.get("error", "AgentApp failed"))[:350]
+                        return
+                    if kind in ("error", "response.failed"):
+                        outcome["failure"] = "Model response failed on SuperGrid"
+                        return
+                    if kind.startswith("travel."):
+                        relay(str(data.get("kind") or kind[len("travel."):]),
+                              data.get("data") if isinstance(data.get("data"), dict) else {})
+                return  # The stream closed: the run ended without a travel.* verdict.
+            except Exception as exc:
+                attempt += 1
+                delay = STREAM_RETRY_DELAYS_S[attempt - 1] if attempt <= len(STREAM_RETRY_DELAYS_S) else None
+                if delay is None or stop.is_set() or time.monotonic() + delay >= deadline:
+                    outcome["error"] = exc
+                    return
+                outcome["reconnects"] = attempt
+                relay("flower.stream.reconnecting", {"attempt": attempt, "delay_s": delay,
+                                                     "after_task_event_id": last_id, "error": type(exc).__name__})
+                _sleep(delay)
 
     def run_job(self, snapshot: TripSnapshot, event: TripEvent | None, listen: Listener) -> Proposal:
-        """Submit one job, relay its events, and return the validated proposal. Blocks until the run ends."""
+        """Submit one job, relay its events, and return the validated proposal. Blocks until the run ends.
+
+        After StartRun the run is billed: listener failures are counted, not raised; a lost event stream is
+        resumed; and the run is stopped before a timeout or a stream loss is reported.
+        """
         import click
         from flwr.cli.utils import flwr_cli_exc_handler
         from flwr.common.serde import fab_to_proto, user_config_to_proto
-        from flwr.proto.control_pb2 import StartRunRequest, StopRunRequest, StreamRunEventsRequest
+        from flwr.proto.control_pb2 import StartRunRequest, StreamRunEventsRequest
         from flwr.supercore.fab import Fab
 
         fab_hash, content = self.fab()
+        # Nothing is submitted yet: a store failure here fails the job before SuperGrid bills a run.
         listen("flower.submitting", {"fab_hash": fab_hash[:8], "model": self.model,
                                      "federation": self.federation or "account default"})
+        listener_errors = 0
+
+        def relay(kind: str, data: dict) -> None:
+            """Deliver one of run_job's own events (streamed events go through relay_stream)."""
+            nonlocal listener_errors
+            try:
+                listen(kind, data)
+            except Exception:  # After StartRun a listener failure (say a locked store) must not abandon the run.
+                listener_errors += 1
+
         client = self._client()
-        run_id = None
         try:
             request = StartRunRequest(fab=fab_to_proto(Fab(fab_hash, content, {})),
                                       override_config=user_config_to_proto(self._overrides(encode_job(snapshot, event), snapshot.data_mode)),
@@ -128,49 +246,42 @@ class FlowerBackend:
                     response = client.StartRun(request)
             except click.ClickException as exc:
                 raise FlowerError(f"SuperGrid rejected the run: {exc.format_message()}") from None
-            if not response.HasField("run_id"):
-                raise FlowerError("SuperGrid did not start a run")
-            run_id = response.run_id
-            listen("flower.run.started", {"run_id": str(run_id), "federation": response.federation or self.federation,
-                                          "model": self.model, "note": response.note if response.HasField("note") else ""})
+            run_id = run_id_from(response)
+            started = {"run_id": str(run_id), "federation": response.federation or self.federation,
+                       "model": self.model, "note": response.note if response.HasField("note") else ""}
+            relay("flower.run.started", started)
+
+            def open_stream(after_id: int | None):
+                if after_id is None:
+                    return client.StreamRunEvents(StreamRunEventsRequest(run_id=run_id))
+                return client.StreamRunEvents(StreamRunEventsRequest(run_id=run_id, after_task_event_id=after_id))
+
             outcome: dict = {}
-
-            def consume():
-                try:
-                    for item in client.StreamRunEvents(StreamRunEventsRequest(run_id=run_id)):
-                        kind, data = _payload(item.task_event)
-                        if kind == "travel.result":
-                            outcome["result"] = data
-                            return
-                        if kind == "travel.failed":
-                            outcome["failure"] = str(data.get("error", "AgentApp failed"))[:350]
-                            return
-                        if kind in ("error", "response.failed"):
-                            outcome["failure"] = "Model response failed on SuperGrid"
-                            return
-                        if kind.startswith("travel."):
-                            listen(str(data.get("kind") or kind[len("travel."):]), data.get("data") if isinstance(data.get("data"), dict) else {})
-                except Exception as exc:  # Surface transport failures to the waiting thread.
-                    outcome["error"] = exc
-
-            worker = threading.Thread(target=consume, name="flower-run-events", daemon=True)
+            stop = threading.Event()
+            deadline = time.monotonic() + self.run_timeout_s
+            worker = threading.Thread(target=self.relay_stream, args=(open_stream, listen, outcome, deadline, stop),
+                                      name="flower-run-events", daemon=True)
             worker.start()
             worker.join(self.run_timeout_s)
+            relayed = outcome.get("relayed", 0)
             if worker.is_alive():
-                try:
-                    client.StopRun(StopRunRequest(run_id=run_id))
-                finally:
-                    client.close()
-                raise FlowerError(f"SuperGrid run {run_id} exceeded {self.run_timeout_s:.0f}s and was stopped")
+                stop.set()
+                stopped = self._stop_run(client, run_id)
+                raise FlowerError(f"SuperGrid run {run_id} exceeded {self.run_timeout_s:.0f}s after relaying "
+                                  f"{relayed} events; {stopped}")
             if "result" in outcome:
                 proposal = decode_result(outcome["result"])
-                listen("flower.run.finished", {"run_id": str(run_id), "status": "completed",
-                                               "metrics": outcome["result"].get("metrics", {})})
+                finished = {"run_id": str(run_id), "status": "completed", "relayed": relayed,
+                            "metrics": outcome["result"].get("metrics", {}),
+                            "listener_errors": listener_errors + outcome.get("listener_errors", 0)}
+                relay("flower.run.finished", finished)
                 return proposal
             if "failure" in outcome:
                 raise FlowerError(f"SuperGrid run {run_id} failed: {outcome['failure']}")
             if "error" in outcome:
-                raise FlowerError(f"Lost the SuperGrid event stream for run {run_id}: {type(outcome['error']).__name__}")
+                stopped = self._stop_run(client, run_id)
+                raise FlowerError(f"Lost the SuperGrid event stream for run {run_id} after relaying {relayed} events "
+                                  f"({type(outcome['error']).__name__}); {stopped}")
             raise FlowerError(f"SuperGrid run {run_id} ended without a result: {self.status(client, run_id)}")
         finally:
             client.close()

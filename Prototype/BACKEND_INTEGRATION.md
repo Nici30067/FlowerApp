@@ -39,7 +39,7 @@ TRAVEL_CONTACT="you@example.org" GEMINI_API_KEY=... ./scripts/serve_live.sh 8021
 ```
 
 Pick a port nothing else is using (in this workspace 8000-8011 belong to running servers; the examples use
-8020/8021). `GET /health` answers `{"status":"ok","version":"0.2.3"}` when the server is up.
+8020/8021). `GET /health` answers `{"status":"ok","version":"0.3.1"}` when the server is up.
 
 ### 2.2 Why a plain `VITE_API_BASE` does not work
 

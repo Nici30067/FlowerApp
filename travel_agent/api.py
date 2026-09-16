@@ -165,10 +165,9 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
                 if provider is None:
                     provider = make_provider(data_mode)
                 proposal = Coordinator(provider, runner, emit, budget).plan(snapshot, event)
-            store.finish_job(job_id, proposal)
             # Clicking Create trip authorizes the initial itinerary. Every later revision requires review.
-            if snapshot.revision == 0 and event is None and proposal.proposed.itinerary.validation.valid:
-                store.accept(proposal.id)
+            auto_accept = snapshot.revision == 0 and event is None
+            store.finish_job(job_id, proposal, auto_accept=auto_accept)
             emit("job.finished", {"job_id": job_id, "proposal_id": proposal.id, "metrics": metrics or budget.metrics()})
         except Exception as exc:
             # Do not expose provider credentials or arbitrary model response text.
@@ -293,10 +292,9 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
     @app.post("/internal/jobs/{job_id}/result")
     def worker_result(job_id: str, request: Request, body: Proposal):
         store.verify_worker(job_id, worker_token(request))
-        store.finish_job(job_id, body)
         payload = store.job_input(job_id)
-        if body.base_revision == 0 and payload["event"] is None and body.proposed.itinerary.validation.valid:
-            store.accept(body.id)
+        auto_accept = body.base_revision == 0 and payload["event"] is None
+        store.finish_job(job_id, body, auto_accept=auto_accept)
         store.append_event(job_id, "job.finished", {"job_id": job_id, "proposal_id": body.id})
         return {"ok": True}
 

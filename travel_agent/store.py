@@ -133,7 +133,7 @@ class Store:
                               (job_id, since)).fetchall()
         return [{"seq": r["seq"], "type": r["event_type"], "data": json.loads(r["data"])} for r in rows]
 
-    def finish_job(self, job_id: str, proposal: Proposal):
+    def finish_job(self, job_id: str, proposal: Proposal, auto_accept: bool = False):
         from travel_agent.planning.engine import validate
         expected = self.job_input(job_id)
         original = TripSnapshot.model_validate(expected["snapshot"])
@@ -153,6 +153,11 @@ class Store:
             check = validate(proposal.proposed, proposal.proposed.itinerary)
             if not check.valid:
                 raise Conflict("Worker result failed independent validation")
+        # Auto-accept (the initial build) is committed in the same transaction as finish_job so
+        # that a concurrent poller never observes the transient 'awaiting_review' state.
+        if auto_accept and not (proposal.proposed.itinerary and proposal.proposed.itinerary.validation.valid
+                                 and validate(proposal.proposed, proposal.proposed.itinerary).valid):
+            auto_accept = False
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             job = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -161,10 +166,20 @@ class Store:
             current = db.execute("SELECT revision FROM trips WHERE id=?", (original.id,)).fetchone()
             if current[0] != original.revision:
                 raise Conflict("The trip changed while this job was running")
-            db.execute("INSERT INTO proposals VALUES(?,?,?,?,?)",
-                (proposal.id, proposal.trip_id, proposal.base_revision, "pending", proposal.model_dump_json()))
-            db.execute("UPDATE jobs SET status='awaiting_review',proposal_id=?,token_hash='' WHERE id=?",
-                       (proposal.id, job_id))
+            if auto_accept:
+                updated = db.execute("UPDATE trips SET revision=?,data=? WHERE id=? AND revision=?",
+                    (proposal.proposed.revision, proposal.proposed.model_dump_json(), proposal.trip_id, proposal.base_revision))
+                if updated.rowcount != 1:
+                    raise Conflict("Stale proposal: refresh the current trip before retrying")
+                db.execute("INSERT INTO proposals VALUES(?,?,?,?,?)",
+                    (proposal.id, proposal.trip_id, proposal.base_revision, "accepted", proposal.model_dump_json()))
+                db.execute("UPDATE jobs SET status='completed',proposal_id=?,token_hash='' WHERE id=?",
+                           (proposal.id, job_id))
+            else:
+                db.execute("INSERT INTO proposals VALUES(?,?,?,?,?)",
+                    (proposal.id, proposal.trip_id, proposal.base_revision, "pending", proposal.model_dump_json()))
+                db.execute("UPDATE jobs SET status='awaiting_review',proposal_id=?,token_hash='' WHERE id=?",
+                           (proposal.id, job_id))
 
     def fail_job(self, job_id: str, message: str):
         with self.connection() as db:

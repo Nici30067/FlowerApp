@@ -2,9 +2,8 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 
 import { CITIES, getCity, placesForCity } from "@/lib/travel/data";
-import { fmtTime } from "@/lib/travel/planner";
-import { GatewayError, callGatewayJson } from "@/lib/travel/gateway.server";
-import type { AgentFinding, Brief } from "@/lib/travel/types";
+import { fmtTime, fallbackOrder, haversineKm } from "@/lib/travel/planner";
+import type { AgentFinding, Brief, Place } from "@/lib/travel/types";
 
 const briefSchema = z.object({
   cityId: z.string().nullable(),
@@ -20,47 +19,10 @@ const messageSchema = z.object({
   content: z.string(),
 });
 
-function gatewayMessage(error: unknown): { status: number; message: string } {
-  if (error instanceof GatewayError) {
-    if (error.status === 402)
-      return { status: 402, message: `AI credits are exhausted. ${error.message}` };
-    if (error.status === 429)
-      return { status: 429, message: "The AI is rate limited right now — try again in a moment." };
-    if (error.status === 401 || error.status === 403)
-      return { status: error.status, message: `AI access is blocked: ${error.message}` };
-    return { status: error.status, message: error.message };
-  }
-  return { status: 500, message: "The AI call failed unexpectedly." };
-}
-
 /* ------------------------------------------------------------------ */
-/* 1. Intake — one question at a time until the brief is complete      */
+/* 1. Intake — one question at a time until the brief is complete,     */
+/*    parsed locally with no external AI call.                        */
 /* ------------------------------------------------------------------ */
-
-const INTAKE_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    reply: { type: "string" },
-    complete: { type: "boolean" },
-    cityId: { type: ["string", "null"] },
-    startMin: { type: ["integer", "null"] },
-    endMin: { type: ["integer", "null"] },
-    budgetEur: { type: ["number", "null"] },
-    interests: { type: "array", items: { type: "string" } },
-    maxWalkKm: { type: ["number", "null"] },
-  },
-  required: [
-    "reply",
-    "complete",
-    "cityId",
-    "startMin",
-    "endMin",
-    "budgetEur",
-    "interests",
-    "maxWalkKm",
-  ],
-} as const;
 
 interface IntakeResult {
   reply: string;
@@ -73,75 +35,154 @@ interface IntakeResult {
   maxWalkKm: number | null;
 }
 
+function extractCity(text: string): string | null {
+  const lower = text.toLowerCase();
+  for (const c of CITIES) {
+    if (lower.includes(c.id) || lower.includes(c.name.toLowerCase()))
+      return c.id;
+  }
+  return null;
+}
+
+function extractHours(text: string): {
+  startMin: number | null;
+  endMin: number | null;
+} {
+  const re =
+    /(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:to|until|-|–)\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i;
+  const m = re.exec(text);
+  if (!m) return { startMin: null, endMin: null };
+  const [, h1, m1, ap1, h2, m2, ap2] = m;
+  let startH = Number(h1);
+  let endH = Number(h2);
+  const startPart = m1 ? Number(m1) : 0;
+  const endPart = m2 ? Number(m2) : 0;
+  if (ap1?.toLowerCase() === "pm" && startH < 12) startH += 12;
+  if (ap2?.toLowerCase() === "pm" && endH < 12) endH += 12;
+  if (!ap1 && !ap2 && endH <= startH) endH += 12;
+  return { startMin: startH * 60 + startPart, endMin: endH * 60 + endPart };
+}
+
+function extractBudget(text: string): number | null {
+  const m = /€\s*(\d+)|(\d+)\s*(?:eur|euros?)\b/i.exec(text);
+  if (m) return Number(m[1] ?? m[2]);
+  if (/\bcheap\b/i.test(text)) return 40;
+  return null;
+}
+
+const INTEREST_WORDS: Record<string, string> = {
+  art: "art",
+  architecture: "architecture",
+  park: "park",
+  parks: "park",
+  garden: "park",
+  gardens: "park",
+  coffee: "coffee",
+  history: "history",
+  food: "food",
+  books: "books",
+  shopping: "shopping",
+  view: "view",
+  views: "view",
+  music: "music",
+  market: "market",
+  markets: "market",
+};
+
+function extractInterests(text: string): string[] {
+  const lower = text.toLowerCase();
+  const found = new Set<string>();
+  for (const [word, tag] of Object.entries(INTEREST_WORDS)) {
+    if (new RegExp(`\\b${word}\\b`).test(lower)) found.add(tag);
+  }
+  return [...found];
+}
+
+function extractWalk(text: string): number | null {
+  const m = /(\d+(?:\.\d+)?)\s*km\b/i.exec(text);
+  return m ? Number(m[1]) : null;
+}
+
 export const intakeTurn = createServerFn({ method: "POST" })
   .inputValidator((input: unknown) =>
-    z.object({ messages: z.array(messageSchema), brief: briefSchema }).parse(input),
+    z
+      .object({ messages: z.array(messageSchema), brief: briefSchema })
+      .parse(input),
   )
-  .handler(async ({ data }) => {
-    const cityList = CITIES.map((c) => `${c.id} (${c.name}, ${c.country})`).join(", ");
-    const system = `You are the intake host of "Travel Companion", a one-day city planner.
-Collect exactly six facts: city, start time, end time, budget in euros, interests, and maximum total walking in km.
-Supported cities only: ${cityList}. If the user names an unsupported city, say so warmly and offer the supported ones.
-Ask ONE question per turn, in one or two short friendly sentences. Never ask for something already known.
-Times are minutes from midnight (10:00 = 600). If the user gives no walking limit after you ask once, use 6.
-Set complete to true only when city, startMin, endMin, budgetEur and at least one interest are known.
-When complete, reply with a one-sentence confirmation and say the specialists are starting.
-Carry forward every already-known value unchanged. Never invent prices, travel times or place names.`;
+  .handler(
+    ({
+      data,
+    }):
+      | ({ ok: true } & IntakeResult)
+      | { ok: false; status: number; message: string } => {
+      const lastUser = [...data.messages]
+        .reverse()
+        .find((m) => m.role === "user");
+      const text = lastUser?.content ?? "";
 
-    const input = JSON.stringify({ knownSoFar: data.brief, conversation: data.messages });
+      const cityId = extractCity(text) ?? data.brief.cityId;
+      const { startMin, endMin } = extractHours(text);
+      const budgetEur = extractBudget(text) ?? data.brief.budgetEur;
+      const newInterests = extractInterests(text);
+      const maxWalkKm = extractWalk(text) ?? data.brief.maxWalkKm;
 
-    try {
-      const out = await callGatewayJson<IntakeResult>({
-        system,
-        input,
-        schemaName: "intake_turn",
-        schema: INTAKE_SCHEMA,
-      });
-      return { ok: true as const, ...out };
-    } catch (error) {
-      const { status, message } = gatewayMessage(error);
-      return { ok: false as const, status, message };
-    }
-  });
+      const merged: Brief = {
+        cityId,
+        startMin: startMin ?? data.brief.startMin,
+        endMin: endMin ?? data.brief.endMin,
+        budgetEur,
+        interests: newInterests.length
+          ? [...new Set([...data.brief.interests, ...newInterests])]
+          : data.brief.interests,
+        maxWalkKm,
+      };
+
+      const complete = Boolean(
+        merged.cityId &&
+        merged.startMin !== null &&
+        merged.endMin !== null &&
+        merged.budgetEur !== null &&
+        merged.interests.length > 0,
+      );
+
+      let reply: string;
+      if (complete) {
+        const city = getCity(merged.cityId!)!;
+        reply =
+          `Great — a day in ${city.name} from ${fmtTime(merged.startMin!)} to ${fmtTime(merged.endMin!)}, ` +
+          `around €${merged.budgetEur}, focused on ${merged.interests.join(", ")}. Sending this to the specialists now…`;
+      } else if (!merged.cityId) {
+        reply = `Which city are you visiting? I can plan for ${CITIES.map((c) => c.name).join(", ")}.`;
+      } else if (merged.startMin === null || merged.endMin === null) {
+        reply = "What time does your day start and end?";
+      } else if (merged.budgetEur === null) {
+        reply = "Roughly what's your budget for the day, in euros?";
+      } else {
+        reply =
+          "What are you interested in — art, history, parks, food, views, shopping…?";
+      }
+
+      return {
+        ok: true,
+        reply,
+        complete,
+        cityId: merged.cityId,
+        startMin: merged.startMin,
+        endMin: merged.endMin,
+        budgetEur: merged.budgetEur,
+        interests: merged.interests,
+        maxWalkKm: merged.maxWalkKm,
+      };
+    },
+  );
 
 /* ------------------------------------------------------------------ */
-/* 2. The four specialists                                             */
+/* 2. The four specialists — deterministic ranking, no external AI.    */
 /* ------------------------------------------------------------------ */
-
-const SPECIALIST_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  properties: {
-    orderedPlaceIds: { type: "array", items: { type: "string" } },
-    reasons: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: { placeId: { type: "string" }, reason: { type: "string" } },
-        required: ["placeId", "reason"],
-      },
-    },
-    findings: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        properties: {
-          agent: { type: "string", enum: ["discovery", "conditions", "mobility", "budget"] },
-          headline: { type: "string" },
-          notes: { type: "array", items: { type: "string" } },
-        },
-        required: ["agent", "headline", "notes"],
-      },
-    },
-  },
-  required: ["orderedPlaceIds", "reasons", "findings"],
-} as const;
 
 interface SpecialistResult {
   orderedPlaceIds: string[];
-  reasons: Array<{ placeId: string; reason: string }>;
+  reasons: Record<string, string>;
   findings: AgentFinding[];
 }
 
@@ -156,71 +197,141 @@ export const runSpecialists = createServerFn({ method: "POST" })
       })
       .parse(input),
   )
-  .handler(async ({ data }) => {
-    const brief: Brief = data.brief;
-    const cityId = brief.cityId ?? "berlin";
-    const city = getCity(cityId);
-    const places = placesForCity(cityId);
-
-    const catalogue = places.map((p) => ({
-      id: p.id,
-      name: p.name,
-      category: p.category,
-      tags: p.tags,
-      outdoor: p.outdoor,
-      hoursKnown: p.hours !== null,
-      opensAt: p.hours ? fmtTime(p.hours.open) : "unknown",
-      closesAt: p.hours ? fmtTime(p.hours.close) : "unknown",
-      priceKnown: p.priceEur !== null,
-      typicalVisitMin: p.durationMin,
-      note: p.blurb,
-    }));
-
-    const system = `You are a panel of four travel specialists planning ONE day in ${city?.name ?? cityId}.
-- discovery: rank places against the traveller's interests
-- conditions: judge the weather and which stops are exposed
-- mobility: judge what is sensible on foot within the walking limit
-- budget: judge whether the selection fits the money and the hours
-
-HARD RULES
-- You may ONLY choose place ids from the catalogue given. Never invent a place.
-- You must NOT state any arrival time, travel time, distance in km, or price. The app computes all of those.
-- Any fact the catalogue marks unknown must be described as unknown, never estimated.
-- Locked places MUST appear in orderedPlaceIds. Completed places MUST NOT appear.
-- Order the ids as a sensible walking sequence through the day, 4 to 7 stops, including one food stop when interests or the hours suggest a meal.
-- Give one short reason per chosen place, written to the traveller ("you said you like...").
-- Return exactly four findings, one per agent, each with a one-line headline and 2-3 short notes.`;
-
-    const input = JSON.stringify({
-      brief: {
-        ...brief,
-        startTime: brief.startMin !== null ? fmtTime(brief.startMin) : "unknown",
-        endTime: brief.endMin !== null ? fmtTime(brief.endMin) : "unknown",
-      },
-      forecastByHour: city?.forecast ?? [],
-      lockedPlaceIds: data.lockedIds,
-      completedPlaceIds: data.doneIds,
-      changeTrigger: data.trigger,
-      catalogue,
-    });
-
-    try {
-      const out = await callGatewayJson<SpecialistResult>({
-        system,
-        input,
-        schemaName: "specialist_panel",
-        schema: SPECIALIST_SCHEMA,
-      });
-
-      const valid = new Set(places.map((p) => p.id));
+  .handler(
+    ({
+      data,
+    }):
+      | ({ ok: true } & SpecialistResult)
+      | { ok: false; status: number; message: string } => {
+      const brief: Brief = data.brief;
+      const cityId = brief.cityId ?? "berlin";
+      const city = getCity(cityId)!;
+      const places = placesForCity(cityId);
+      const locked = new Set(data.lockedIds);
       const done = new Set(data.doneIds);
-      const orderedPlaceIds = out.orderedPlaceIds.filter((id) => valid.has(id) && !done.has(id));
-      const reasons: Record<string, string> = {};
-      for (const r of out.reasons) if (valid.has(r.placeId)) reasons[r.placeId] = r.reason;
+      const rainTriggered = (data.trigger ?? "").toLowerCase().includes("rain");
+      const rainHeavy =
+        city.forecast.filter((f) => f.sky === "rain").length >=
+        city.forecast.length / 2;
 
-      return { ok: true as const, orderedPlaceIds, reasons, findings: out.findings };
-    } catch (error) {
-      const { status, message } = gatewayMessage(error);
-      return { ok: false as const, status, message };
-    }
-  });
+      const available = places.filter((p) => !done.has(p.id));
+      const lockedPlaces = available.filter((p) => locked.has(p.id));
+
+      const ranked = fallbackOrder(
+        available.filter(
+          (p) => !locked.has(p.id) && !(rainTriggered && p.outdoor),
+        ),
+        brief,
+      ).map((id) => available.find((p) => p.id === id)!);
+
+      const maxWalk = brief.maxWalkKm ?? 6;
+      const targetCount = maxWalk < 3 ? 4 : maxWalk > 8 ? 7 : 5;
+
+      const chosen: Place[] = [...lockedPlaces];
+      for (const p of ranked) {
+        if (chosen.length >= targetCount) break;
+        if (chosen.some((c) => c.id === p.id)) continue;
+        chosen.push(p);
+      }
+
+      if (
+        !chosen.some((p) => p.category === "food" || p.category === "market")
+      ) {
+        const food = ranked.find(
+          (p) =>
+            (p.category === "food" || p.category === "market") &&
+            !chosen.some((c) => c.id === p.id),
+        );
+        if (food) {
+          if (chosen.length >= targetCount) {
+            const dropIndex = [...chosen]
+              .reverse()
+              .findIndex((p) => !locked.has(p.id));
+            if (dropIndex !== -1)
+              chosen.splice(chosen.length - 1 - dropIndex, 1);
+          }
+          chosen.push(food);
+        }
+      }
+
+      // Order into a sensible walking sequence via nearest-neighbour from the city centre.
+      const ordered: Place[] = [];
+      const pool = [...chosen];
+      let cursor: { lat: number; lng: number } = city.center;
+      while (pool.length) {
+        pool.sort((a, b) => haversineKm(cursor, a) - haversineKm(cursor, b));
+        const next = pool.shift()!;
+        ordered.push(next);
+        cursor = next;
+      }
+
+      const reasons: Record<string, string> = {};
+      for (const p of ordered) {
+        if (locked.has(p.id)) {
+          reasons[p.id] = "Kept in place — you locked this stop.";
+          continue;
+        }
+        const matched = p.tags.find((t) => brief.interests.includes(t));
+        reasons[p.id] = matched
+          ? `Matches your interest in ${matched}.`
+          : p.category === "food" || p.category === "market"
+            ? "A place to eat along the way."
+            : "Fills out a walkable day.";
+      }
+
+      const outdoorCount = ordered.filter((p) => p.outdoor).length;
+      const unknownPriceCount = ordered.filter(
+        (p) => p.priceEur === null,
+      ).length;
+      const knownCost = ordered.reduce((sum, p) => sum + (p.priceEur ?? 0), 0);
+
+      const findings: AgentFinding[] = [
+        {
+          agent: "discovery",
+          headline: `Ranked ${places.length} places against ${brief.interests.join(", ") || "your interests"}.`,
+          notes: [
+            `Picked ${ordered.length} stops — ${outdoorCount} outdoor, ${ordered.length - outdoorCount} indoor.`,
+            locked.size
+              ? `Kept ${locked.size} locked stop(s) in place.`
+              : "No locked stops yet.",
+          ],
+        },
+        {
+          agent: "conditions",
+          headline: rainTriggered
+            ? "Rain expected — favoured indoor stops for the rest of the day."
+            : rainHeavy
+              ? `${city.name}'s forecast turns wet later in the day.`
+              : `${city.name} looks mostly dry today.`,
+          notes: [
+            rainTriggered
+              ? "Outdoor-only stops were deprioritised for this revision."
+              : "No weather-driven changes needed yet.",
+          ],
+        },
+        {
+          agent: "mobility",
+          headline: `Ordered stops for a walkable route from ${city.name}'s centre.`,
+          notes: [`Walking limit: ${maxWalk} km.`],
+        },
+        {
+          agent: "budget",
+          headline: `Known costs total €${knownCost}${unknownPriceCount ? "+" : ""} for this selection.`,
+          notes: [
+            brief.budgetEur !== null
+              ? knownCost <= brief.budgetEur
+                ? `Within your €${brief.budgetEur} budget.`
+                : `Above your €${brief.budgetEur} budget — consider dropping a paid stop.`
+              : "No budget given yet — using free stops where possible.",
+          ],
+        },
+      ];
+
+      return {
+        ok: true,
+        orderedPlaceIds: ordered.map((p) => p.id),
+        reasons,
+        findings,
+      };
+    },
+  );

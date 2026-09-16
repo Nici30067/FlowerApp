@@ -89,12 +89,15 @@ class TripRequest(Contract):
     title: str = Field(default="A day in Berlin", min_length=1, max_length=120)
     city: str = Field(default="Berlin", max_length=80)
     timezone: str = "Europe/Berlin"
+    # start/end describe day 1's planning window; day_window()/day_request() project it forward.
     start: datetime = datetime.fromisoformat("2026-09-16T10:00:00+02:00")
     end: datetime = datetime.fromisoformat("2026-09-16T17:00:00+02:00")
+    days: int = Field(default=1, ge=1, le=14)
     origin: Coordinate = Field(default_factory=lambda: Coordinate(lat=52.5225, lon=13.4024))
     destination: Coordinate = Field(default_factory=lambda: Coordinate(lat=52.5225, lon=13.4024))
     interests: list[str] = Field(default_factory=lambda: ["art", "architecture", "parks", "coffee"])
     currency: Literal["EUR", "USD", "GBP", "SEK"] = "EUR"
+    # budget_minor is a whole-trip total; every other limit below is per day.
     budget_minor: int = Field(default=6000, ge=0, le=1000000)
     max_walking_m: int = Field(default=5000, ge=0, le=50000)
     max_continuous_walking_s: int = Field(default=1800, ge=60, le=14400)
@@ -124,6 +127,31 @@ class TripRequest(Contract):
         if len({r.place_id for r in self.reservations}) != len(self.reservations):
             raise ValueError("Duplicate reservations for a place are unsupported")
         return self
+
+    def day_window(self, index: int) -> tuple[datetime, datetime]:
+        """The localized start/end datetimes for day `index` (0-based). Adds whole
+        local calendar days (via ZoneInfo), not a fixed-offset timedelta, so DST
+        transitions never silently shift the schedule by an hour."""
+        tz = ZoneInfo(self.timezone)
+        shift = timedelta(days=index)
+
+        def shifted(moment: datetime) -> datetime:
+            return moment.astimezone(tz) + shift
+
+        return shifted(self.start), shifted(self.end)
+
+    def day_request(self, index: int) -> "TripRequest":
+        """This request projected onto a single day, for reuse by the single-day engine."""
+        start, end = self.day_window(index)
+        return self.model_copy(update={"start": start, "end": end, "days": 1})
+
+    @property
+    def trip_start(self) -> datetime:
+        return self.start
+
+    @property
+    def trip_end(self) -> datetime:
+        return self.day_window(self.days - 1)[1]
 
 
 class Leg(Contract):
@@ -162,6 +190,7 @@ class Issue(Contract):
     severity: Literal["error", "warning"]
     message: str
     place_id: str | None = None
+    day_index: int | None = None
 
 
 class Validation(Contract):
@@ -170,7 +199,11 @@ class Validation(Contract):
     issues: list[Issue] = Field(default_factory=list)
 
 
-class Itinerary(Contract):
+class DayPlan(Contract):
+    """A single day's schedule. This is what the single-day engine (planning/engine.py)
+    builds and validates; a multi-day Itinerary is a list of these."""
+    index: int = Field(default=0, ge=0)
+    date: str = ""  # ISO date (YYYY-MM-DD), local to the trip timezone; set by the coordinator.
     stops: list[Stop] = Field(default_factory=list)
     legs: list[Leg] = Field(default_factory=list)
     breaks: list[Break] = Field(default_factory=list)
@@ -181,6 +214,58 @@ class Itinerary(Contract):
     unknown_cost_count: int = 0
     validation: Validation = Field(default_factory=lambda: Validation(valid=False, status="infeasible"))
     score: float = 0
+
+
+_DAY_PLAN_FIELDS = {"stops", "legs", "breaks", "end_arrival", "walking_m", "travel_duration_s",
+                    "cost_minor", "unknown_cost_count", "validation", "score"}
+
+
+class Itinerary(Contract):
+    """The whole trip: one DayPlan per day, plus trip-level totals and validation."""
+    days: list[DayPlan] = Field(default_factory=list)
+    walking_m: int = 0
+    travel_duration_s: int = 0
+    cost_minor: int = 0
+    unknown_cost_count: int = 0
+    validation: Validation = Field(default_factory=lambda: Validation(valid=False, status="infeasible"))
+    score: float = 0
+
+    @model_validator(mode="before")
+    @classmethod
+    def _wrap_single_day(cls, data: Any) -> Any:
+        """Accept a bare DayPlan (used internally when the coordinator drives one day),
+        and upgrade a legacy single-day Itinerary payload (persisted before multi-day
+        support existed, or a single-day dict built by the engine) into a 1-day trip."""
+        if isinstance(data, DayPlan):
+            day = data
+            return {"days": [day], "walking_m": day.walking_m, "travel_duration_s": day.travel_duration_s,
+                    "cost_minor": day.cost_minor, "unknown_cost_count": day.unknown_cost_count,
+                    "validation": day.validation, "score": day.score}
+        if isinstance(data, dict) and "days" not in data and "end_arrival" in data:
+            day = {k: v for k, v in data.items() if k in _DAY_PLAN_FIELDS}
+            day["index"] = 0
+            end = data["end_arrival"]
+            day["date"] = (end[:10] if isinstance(end, str) else end.date().isoformat())
+            trip_totals = {k: data[k] for k in _DAY_PLAN_FIELDS if k in data
+                           and k not in ("stops", "legs", "breaks", "end_arrival")}
+            return {**trip_totals, "days": [day]}
+        return data
+
+    @property
+    def stops(self) -> list[Stop]:
+        return [s for d in self.days for s in d.stops]
+
+    @property
+    def legs(self) -> list[Leg]:
+        return [l for d in self.days for l in d.legs]
+
+    @property
+    def breaks(self) -> list[Break]:
+        return [b for d in self.days for b in d.breaks]
+
+    @property
+    def end_arrival(self) -> datetime:
+        return self.days[-1].end_arrival
 
 
 class Progress(Contract):

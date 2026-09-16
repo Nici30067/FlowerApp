@@ -174,8 +174,14 @@ def snapshot_context(snapshot: TripSnapshot, matrix: dict | None = None) -> dict
                "route_matrix": compact_matrix(matrix or {}, snapshot),
                "shared_reports": [r.model_dump(mode="json") for r in snapshot.reports],
                "shared_messages": [m.model_dump(mode="json") for m in snapshot.messages],
-               "proposed_itinerary": snapshot.itinerary.model_dump(mode="json", exclude={"legs", "breaks"})
-                   if snapshot.itinerary else None}
+               "proposed_itinerary": ({
+                   "stops": [s.model_dump(mode="json") for s in snapshot.itinerary.stops],
+                   "end_arrival": snapshot.itinerary.end_arrival.isoformat(),
+                   "walking_m": snapshot.itinerary.walking_m,
+                   "cost_minor": snapshot.itinerary.cost_minor,
+                   "unknown_cost_count": snapshot.itinerary.unknown_cost_count,
+                   "validation": snapshot.itinerary.validation.model_dump(mode="json"),
+               } if snapshot.itinerary else None)}
     return localize(context, zone)
 
 

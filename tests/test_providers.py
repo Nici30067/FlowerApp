@@ -8,13 +8,16 @@ from travel_agent.schemas import Coordinate, TripRequest
 
 
 def provider(handler):
-    return LiveProvider(contact='test@example.invalid', ors_key='test-ors-key', allow_public_overpass=True,
+    """An ORS-routed live provider; OSRM routing is covered by tests/test_live_routing.py."""
+    return LiveProvider(contact='test@example.invalid', ors_key='test-ors-key', router='ors', allow_public_overpass=True,
                         client=httpx.Client(transport=httpx.MockTransport(handler)))
 
 
 def test_live_mode_requires_explicit_configuration():
     with pytest.raises(ProviderError): LiveProvider(contact='', ors_key='')
     with pytest.raises(ProviderError): LiveProvider(contact='test', ors_key='key')
+    with pytest.raises(ProviderError): LiveProvider(contact='test', ors_key='key', router='ors')
+    with pytest.raises(ProviderError): LiveProvider(contact='', ors_key='', router='osrm', allow_public_overpass=True)
 
 
 def test_no_fabricated_osm_identifiers_in_fixtures():

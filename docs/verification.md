@@ -22,3 +22,49 @@ cycle costs about 500; one fallback-model cycle about 60.
 Final demo configuration: `agent.model="flower-endeavor-v1.0"`, `agent.max-tool-turns=0`,
 `agent.reasoning-effort="low"`, `agent.model-timeout-s=120`, `travel.data-mode="fixture"`.
 Fallback: `agent.model="openai/gpt-5.6-sol"` with identical code.
+
+## Google Gemini through the Chat Completions adapter (local backend, 16 September 2026)
+
+`gemini-3.8-flash` via `https://generativelanguage.googleapis.com/v1beta/openai/` with `TRAVEL_MODEL_API=chat` and one
+evidence tool round per specialist. Gemini 3.x requires its opaque `thought_signature` to be echoed back with every
+replayed tool call; the adapter carries the provider's raw tool-call object through the round trip for that reason.
+
+| Step | Result |
+| --- | --- |
+| Initial plan (browser, `Build itinerary`) | 9 model calls, 6 tool calls, 29.3 s total; calls of 1.6 to 7.6 s; revision 1 with 5 stops, provisional; one automatic repair turn (Mobility's first final answer was not a report object) |
+| Rain replan (browser, `Simulate rain`) | 12 model calls, 7 tool calls, 40.1 s; `conditions -> discovery` request, Discovery re-run; proposed revision 2 with five indoor stops (Humboldt Forum, Neues Museum, James-Simon-Galerie, Mitte bookshop, coffee stop); applied in the browser |
+| Tools used | `get_weather_forecast`, `search_places`, `get_route_matrix`, `assess_costs`, `validate_itinerary` |
+| Repair turns | Gemini's first final answer for Mobility (and once for Conditions) was not a report object; the bounded repair turn recovered every time |
+
+No SuperGrid credits are consumed in this mode. The Flower connectors and the Endeavor bonus apply only to SuperGrid runs.
+
+Local SuperLink (zero credits): the same AgentApp ran `plan then rain` on a local `flower-superlink` whose model provider was the
+Gemini Open Responses proxy (`../gemini-responses-proxy`), run 15607922627542377881, model calls of 4 to 14 s. The chat adapter now adds
+reasoning-token headroom to `max_tokens` so Gemini's thinking does not truncate answers.
+
+## Post-fix rehearsal on Gemini (16 September 2026, local backend, `scripts/serve_gemini.sh 8010`)
+
+Model `gemini-3.8-flash` through the Chat Completions adapter, one tool turn, fixture data, after the review fixes
+(174 -> 180 offline tests).
+
+| Step | Calls | Time | Notes |
+| --- | --- | --- | --- |
+| Build itinerary | 7 model, 4 tool, 1 provider | 34 s | `planner.started` ranking_source `specialists`, candidate_count 12; every specialist cited real evidence ids (`unknown_evidence_ids` empty); usage reported per call (3.0k to 9.8k input tokens) |
+| Simulate rain | 8 model, 5 tool, 1 provider | 54 s | Conditions ran first and asked Discovery for indoor alternatives; `planner.started` candidate_count 7, avoided_count 5; proposal all indoor (coffee, Alte Nationalgalerie, James-Simon-Galerie, Neues Museum, Humboldt Forum), provisional, override flagged |
+
+One earlier rain attempt failed with an HTTP 400 from Gemini during Mobility's second call and succeeded on retry;
+job failures are now logged server-side with the redacted cause so intermittent provider errors can be inspected.
+
+## Any-city live planning on Gemini (16 September 2026, `scripts/serve_live.sh 8011`)
+
+Zero-key live stack: Open-Meteo geocoding, public Overpass (with contact string), OSRM FOSSGIS routing, Open-Meteo
+forecast; model `gemini-3.8-flash` through the Chat Completions adapter, one tool turn.
+
+| Step | Result | Time |
+| --- | --- | --- |
+| GET /api/geocode?q=Tokyo | Tokyo, Japan, 35.6895 / 139.6917, Asia/Tokyo, `fixture_supported=false` | < 1 s |
+| Build itinerary (Tokyo, art/coffee/parks/architecture) | 5 real OSM stops (Sompo Museum of Art, Bunka Gakuen Costume Museum, two cafes, a memorial museum), OSRM walking legs with polylines, 2969 m, provisional (HOURS_UNKNOWN, PRICE_UNKNOWN, OUTDOOR_TRANSFERS warnings) | 87 s |
+| Simulate rain | Conditions asked Discovery for indoor alternatives; all five stops indoor; proposal awaiting review | 66 s |
+
+The real Tokyo forecast that day was 100 percent precipitation, so the initial plan already avoided the four parks
+(`planner.started` avoided_count 4) and the rain replan preserved every stop.

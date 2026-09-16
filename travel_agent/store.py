@@ -133,8 +133,8 @@ class Store:
                               (job_id, since)).fetchall()
         return [{"seq": r["seq"], "type": r["event_type"], "data": json.loads(r["data"])} for r in rows]
 
-    def finish_job(self, job_id: str, proposal: Proposal, auto_accept: bool = False):
-        from travel_agent.planning.engine import validate_trip
+    def finish_job(self, job_id: str, proposal: Proposal):
+        from travel_agent.planning.engine import validate
         expected = self.job_input(job_id)
         original = TripSnapshot.model_validate(expected["snapshot"])
         if proposal.trip_id != original.id or proposal.base_revision != original.revision:
@@ -150,14 +150,9 @@ class Store:
             raise Conflict("Worker changed the assigned data provenance mode")
         # Worker output is independently checked before entering the review queue.
         if proposal.proposed.itinerary and proposal.proposed.itinerary.validation.valid:
-            check = validate_trip(proposal.proposed, proposal.proposed.itinerary)
+            check = validate(proposal.proposed, proposal.proposed.itinerary)
             if not check.valid:
                 raise Conflict("Worker result failed independent validation")
-        # Auto-accept (the initial build) is committed in the same transaction as finish_job so
-        # that a concurrent poller never observes the transient 'awaiting_review' state.
-        if auto_accept and not (proposal.proposed.itinerary and proposal.proposed.itinerary.validation.valid
-                                 and validate_trip(proposal.proposed, proposal.proposed.itinerary).valid):
-            auto_accept = False
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             job = db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -166,20 +161,10 @@ class Store:
             current = db.execute("SELECT revision FROM trips WHERE id=?", (original.id,)).fetchone()
             if current[0] != original.revision:
                 raise Conflict("The trip changed while this job was running")
-            if auto_accept:
-                updated = db.execute("UPDATE trips SET revision=?,data=? WHERE id=? AND revision=?",
-                    (proposal.proposed.revision, proposal.proposed.model_dump_json(), proposal.trip_id, proposal.base_revision))
-                if updated.rowcount != 1:
-                    raise Conflict("Stale proposal: refresh the current trip before retrying")
-                db.execute("INSERT INTO proposals VALUES(?,?,?,?,?)",
-                    (proposal.id, proposal.trip_id, proposal.base_revision, "accepted", proposal.model_dump_json()))
-                db.execute("UPDATE jobs SET status='completed',proposal_id=?,token_hash='' WHERE id=?",
-                           (proposal.id, job_id))
-            else:
-                db.execute("INSERT INTO proposals VALUES(?,?,?,?,?)",
-                    (proposal.id, proposal.trip_id, proposal.base_revision, "pending", proposal.model_dump_json()))
-                db.execute("UPDATE jobs SET status='awaiting_review',proposal_id=?,token_hash='' WHERE id=?",
-                           (proposal.id, job_id))
+            db.execute("INSERT INTO proposals VALUES(?,?,?,?,?)",
+                (proposal.id, proposal.trip_id, proposal.base_revision, "pending", proposal.model_dump_json()))
+            db.execute("UPDATE jobs SET status='awaiting_review',proposal_id=?,token_hash='' WHERE id=?",
+                       (proposal.id, job_id))
 
     def fail_job(self, job_id: str, message: str):
         with self.connection() as db:
@@ -203,11 +188,10 @@ class Store:
         return [self.proposal(row[0]).model_dump(mode="json") for row in rows]
 
     def accept(self, proposal_id: str) -> TripSnapshot:
-        from travel_agent.planning.engine import validate_trip
+        from travel_agent.planning.engine import validate
         proposal = self.proposal(proposal_id)
         proposed = proposal.proposed
-        if (not proposed.itinerary or not proposed.itinerary.validation.valid
-                or not validate_trip(proposed, proposed.itinerary).valid):
+        if not proposed.itinerary or not proposed.itinerary.validation.valid or not validate(proposed, proposed.itinerary).valid:
             raise Conflict("An infeasible proposal cannot be committed")
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")

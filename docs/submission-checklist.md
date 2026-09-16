@@ -7,7 +7,7 @@
 - [x] `uv sync` and `uv run flwr build` succeed (`tauska67.osm-travel-companion.0-1-0.<hash>.fab`).
 - [x] `uv run flwr login supergrid` completed; `uv run flwr run . supergrid --stream` executes the AgentApp.
 - [x] Complete AgentApp execution path verified on SuperGrid (see `docs/verification.md`).
-- [ ] Publish to Flower Hub: `uv run flwr app publish .` (uploads public sources; run when ready).
+- [x] Published to Flower Hub on 16 September 2026 (withdrawn afterwards: version 0.3.0 is an empty placeholder whose README says the app is retired; version 0.2.2 stays visible under Versions because Hub apps can only be deleted by Flower administrators): https://flower.ai/apps/tauska67/osm-travel-companion/ (`flwr new @tauska67/osm-travel-companion`). The Hub filter skips `travel_agent/web/*` (js, html, css) and `uv.lock`; the full tree lives in the Git repository.
 - [ ] Public Git repository and tag of the submission commit.
 
 ## P0: Flower Endeavor integration
@@ -34,7 +34,7 @@
 
 ## P1 highlights
 
-- [x] 117 offline tests, including bundle configuration, Endeavor-style prose output handling, job codec bounds,
+- [x] 222 offline tests, including bundle configuration, Endeavor-style prose output handling, job codec bounds,
       SuperGrid backend with a fake grid, tampered-result rejection, stale-revision and concurrency checks.
 - [x] CI workflow (`.github/workflows/ci.yml`): ruff, pytest, `flwr build` on Python 3.11 and 3.13.
 - [x] Model, tool, wall-time and per-step model-call budgets; provider size and time limits.

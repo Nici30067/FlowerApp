@@ -3,9 +3,12 @@
 Inputs (`agent.input`):
   * "Plan the Berlin demonstration itinerary."      one planning step on the bundled fixture
   * "plan then rain then budget 30"                 a scripted scenario; valid revisions auto-commit between steps
+  * step commands: plan | rain | refresh | budget N | walk N km (at most MAX_STEPS per run)
   * JSON {"request": ...} / {"event": ...} / {"request": ..., "events": [...]}
   * JSON {"job": "<encoded>"}                        a job handed over by the local map application
   * help | status | export | approve | reject | diagnose
+
+Every step is validated before the first model call, and state is persisted after each successful step.
 """
 from __future__ import annotations
 
@@ -35,7 +38,7 @@ PLAN_COMMANDS = ("plan the berlin demonstration itinerary.", "plan the berlin de
 MAX_STEPS = 6
 HELP = (
     "Start with: Plan the Berlin demonstration itinerary.\n"
-    "Then use: rain; budget 30; walk 2 km; status; approve; reject; export.\n"
+    "Then use: rain; refresh; budget 30; walk 2 km; status; approve; reject; export.\n"
     "Chain a scenario in one run: plan then rain then walk 2 km\n"
     "For explicit configuration, send JSON containing request (TripRequest) or event (TripEvent).\n"
     "Data fixtures remain labeled. Model execution uses the configured Flower model."
@@ -65,6 +68,11 @@ def make_emit(agent):
             say(agent, f"[{data['role']}] {data['report']['summary']}\n")
         elif kind == "collaboration.message":
             say(agent, f"{data['sender']} -> {data['recipient']}: {data['summary']}\n")
+        elif kind == "planner.fallback":
+            say(agent, f"Planner fell back to the catalog: {data['reason']} "
+                       f"({data['candidate_count']} candidates)\n")
+        elif kind == "planner.repair":
+            say(agent, f"Planner repair {'adopted' if data['adopted'] else 'declined'}: {data['reason']}\n")
         elif kind == "validation.completed":
             say(agent, f"Deterministic validation: {data['status']}\n")
     return emit
@@ -87,76 +95,121 @@ def summary(proposal: Proposal, budget: ExecutionBudget) -> str:
     codes = list(dict.fromkeys(i.code for i in itinerary.validation.issues))
     if codes:
         lines.append("Validation notes: " + ", ".join(codes))
+    if state.weather_override:
+        # A scenario override replaces the provider forecast until a refresh (weather_updated) clears it.
+        note = state.weather_override.source.note or state.weather_override.source.provider
+        lines.append(f"Weather: simulated scenario override active ({note})")
     lines.append("Type approve to commit this revision, or reject to keep the current itinerary.")
     return "\n".join(lines)
 
 
 def parse_steps(prompt: str) -> list[str | dict]:
-    """A prompt is one command, a JSON object, or commands joined with 'then' or ';'."""
+    """A prompt is one command, a JSON object, or commands joined with 'then' or ';'.
+
+    Text and JSON scenarios share the MAX_STEPS bound: a JSON request and each of its events count as one step.
+    """
     if prompt.startswith("{"):
         payload = json.loads(prompt)
         if not isinstance(payload, dict) or not payload:
             raise ValueError("JSON input must be a non-empty object")
-        if set(payload) <= {"request", "events"}:
-            steps: list[str | dict] = []
-            if "request" in payload:
-                steps.append({"request": payload["request"]})
+        if set(payload) in ({"event"}, {"job"}):
+            steps: list[str | dict] = [payload]
+        elif set(payload) <= {"request", "events"}:
+            steps = [{"request": payload["request"]}] if "request" in payload else []
             events = payload.get("events", [])
             if not isinstance(events, list):
                 raise ValueError("events must be a list")
             steps.extend({"event": item} for item in events)
-            return steps
-        if set(payload) in ({"event"}, {"job"}):
-            return [payload]
-        raise ValueError("Supply request, event, request with events, or job")
-    steps = [s for s in re.split(r"\s*(?:;|\bthen\b)\s*", prompt.strip(), flags=re.IGNORECASE) if s]
+        else:
+            raise ValueError("Supply request, event, request with events, or job")
+    else:
+        steps = [s for s in re.split(r"\s*(?:;|\bthen\b)\s*", prompt.strip(), flags=re.IGNORECASE) if s]
+    if not steps:
+        raise ValueError("No planning step found")
     if len(steps) > MAX_STEPS:
         raise ValueError(f"A scenario may contain at most {MAX_STEPS} steps")
     return steps
 
 
-def resolve_step(step: str | dict, current: TripSnapshot | None, data_mode: str):
-    """Return (snapshot, event) for one step, or None when the step is not a known command."""
-    def fresh(request: TripRequest) -> TripSnapshot:
-        return TripSnapshot(id=uuid4().hex, request=request, data_mode=data_mode, agent_mode="model")
+Step = tuple[str, TripRequest | TripEvent | None]
+
+
+def classify_step(step: str | dict) -> Step | None:
+    """Classify one step without running it: ("request", TripRequest), ("plan", None) or ("event", TripEvent).
+
+    Malformed JSON shapes raise a ValueError; an unknown text command returns None so the caller shows HELP.
+    """
     if isinstance(step, dict):
         if "request" in step:
-            return fresh(TripRequest.model_validate(step["request"])), None
-        if not current:
-            raise ValueError("Create an itinerary before sending an event")
-        return current, TripEvent.model_validate(step["event"])
+            return "request", TripRequest.model_validate(step["request"])
+        if "event" in step:
+            return "event", TripEvent.model_validate(step["event"])
+        raise ValueError("Supply request or event")
     command = step.strip().lower()
     if command in PLAN_COMMANDS:
-        return current or fresh(TripRequest()), None
-    if not current:
-        return None
+        return "plan", None
     if command == "rain":
-        return current, TripEvent(id=uuid4().hex, kind="rain", simulated=True)
+        return "event", TripEvent(id=uuid4().hex, kind="rain", simulated=True)
+    if command == "refresh":
+        # Clears a scenario override and re-reads the provider forecast; no caller-supplied forecast is accepted.
+        return "event", TripEvent(id=uuid4().hex, kind="weather_updated")
     if match := re.fullmatch(r"budget (\d+(?:\.\d{1,2})?)", command):
-        return current, TripEvent(id=uuid4().hex, kind="budget_changed", payload={"budget_minor": int(Decimal(match[1]) * 100)})
+        payload = {"budget_minor": int(Decimal(match[1]) * 100)}
+        return "event", TripEvent(id=uuid4().hex, kind="budget_changed", payload=payload)
     if match := re.fullmatch(r"walk (\d+(?:\.\d+)?) km", command):
-        return current, TripEvent(id=uuid4().hex, kind="pace_changed", payload={"max_walking_m": int(Decimal(match[1]) * 1000)})
+        payload = {"max_walking_m": int(Decimal(match[1]) * 1000)}
+        return "event", TripEvent(id=uuid4().hex, kind="pace_changed", payload=payload)
     return None
+
+
+def compile_steps(steps: list[str | dict], have_snapshot: bool) -> list[Step] | None:
+    """Validate every step before the first model call.
+
+    Returns None when a text step is not a known command (the caller publishes HELP). An event that would run
+    before any itinerary exists, and any malformed request or event, raise a ValueError.
+    """
+    compiled: list[Step] = []
+    for step in steps:
+        item = classify_step(step)
+        if item is None:
+            return None
+        if item[0] == "event" and not have_snapshot:
+            raise ValueError("Create an itinerary before sending an event")
+        have_snapshot = True
+        compiled.append(item)
+    return compiled
 
 
 class Session:
     """Per-run model configuration. Every planning step receives a fresh, bounded execution budget."""
     def __init__(self, agent, context):
+        config = context.run_config
         self.agent = agent
-        self.model = str(context.run_config.get("agent.model", DEFAULT_MODEL))
-        self.max_tool_turns = int(context.run_config.get("agent.max-tool-turns", 0))
-        self.reasoning_effort = str(context.run_config.get("agent.reasoning-effort", "low"))
-        self.wall_time_s = int(context.run_config.get("agent.wall-time-s", 900))
-        self.max_model_calls = int(context.run_config.get("agent.max-model-calls", 12))
+        self.model = str(config.get("agent.model", DEFAULT_MODEL))
+        self.max_tool_turns = int(config.get("agent.max-tool-turns", 0))
+        self.reasoning_effort = str(config.get("agent.reasoning-effort", "low"))
+        self.wall_time_s = int(config.get("agent.wall-time-s", 900))
+        configured_calls = int(config.get("agent.max-model-calls", 0))
+        # 0 = auto: up to five specialist runs per step, each allowed its tool turns plus a final answer and one repair.
+        self.max_model_calls = configured_calls if configured_calls > 0 else 5 * (self.max_tool_turns + 2)
+        self.max_output_tokens = int(config.get("agent.max-output-tokens", 2000))
+        public_web = bool(config.get("agent.public-web", False))
+        if public_web and self.max_tool_turns == 0:
+            raise ValueError("agent.public-web requires agent.max-tool-turns >= 1")
         self.client = openai_client(os.environ.get("FLWR_RUNTIME_BASE_URL", ""), os.environ.get("FLWR_RUNTIME_API_KEY", ""),
-                                    float(context.run_config.get("agent.model-timeout-s", 120)))
-        self.connectors = agent.connectors if context.run_config.get("agent.public-web", False) else None
+                                    float(config.get("agent.model-timeout-s", 120)))
+        self.connectors = agent.connectors if public_web else None
         self.emit = make_emit(agent)
 
+    def budget(self) -> ExecutionBudget:
+        """A fresh per-step budget; the cap is either the configured value or the auto rule above."""
+        return ExecutionBudget(wall_time_s=self.wall_time_s, max_model_calls=self.max_model_calls)
+
     def plan(self, snapshot: TripSnapshot, event: TripEvent | None, emit=None) -> tuple[Proposal, ExecutionBudget]:
-        budget = ExecutionBudget(wall_time_s=self.wall_time_s, max_model_calls=self.max_model_calls)
+        budget = self.budget()
         emit = emit or self.emit
-        runner = ModelRunner(self.client, self.model, emit, budget, self.max_tool_turns, self.reasoning_effort)
+        runner = ModelRunner(self.client, self.model, emit, budget, self.max_tool_turns, self.reasoning_effort,
+                             self.max_output_tokens)
         provider = make_provider(snapshot.data_mode)
         return Coordinator(provider, runner, emit, budget, self.connectors).plan(snapshot, event), budget
 
@@ -257,7 +310,9 @@ def main(agent: AgentSession, context: Context) -> None:
             context.state["travel"] = ConfigRecord({"snapshot": current.model_dump_json(), "proposal": ""})
             publish(agent, f"Committed revision {current.revision}. Use export for the full structured itinerary.")
         elif command == "reject":
-            context.state["travel"] = ConfigRecord({"snapshot": current.model_dump_json() if current else "", "proposal": ""})
+            if current or pending:
+                context.state["travel"] = ConfigRecord({"snapshot": current.model_dump_json() if current else "",
+                                                        "proposal": ""})
             publish(agent, "Pending changes rejected. The committed itinerary is unchanged.")
         elif command == "export":
             publish(agent, "```json\n" + (current.model_dump_json(indent=2) if current else "null") + "\n```")
@@ -268,33 +323,48 @@ def main(agent: AgentSession, context: Context) -> None:
     if command.startswith("diagnose") and not bridged:
         diagnose(agent, context)
         return
-    session = Session(agent, context)
     if bridged:
-        bridge_run(agent, context, session)
+        bridge_run(agent, context, Session(agent, context))
         return
     steps = parse_steps(prompt)
     if len(steps) == 1 and isinstance(steps[0], dict) and "job" in steps[0]:
-        job_run(agent, session, str(steps[0]["job"]))
+        job_run(agent, Session(agent, context), str(steps[0]["job"]))
         return
+    # Every step is classified and validated up front, so a typo in step 3 costs no model calls in steps 1 and 2.
+    compiled = compile_steps(steps, current is not None)
+    if compiled is None:
+        publish(agent, HELP)
+        return
+    session = Session(agent, context)
     data_mode = str(context.run_config.get("travel.data-mode", "fixture"))
-    proposal = None
-    for index, step in enumerate(steps, 1):
-        resolved = resolve_step(step, current, data_mode)
-        if resolved is None:
-            publish(agent, HELP)
-            return
-        current, event = resolved
-        say(agent, f"\nStep {index} of {len(steps)}: {event.kind if event else 'initial plan'}"
+
+    def fresh(request: TripRequest) -> TripSnapshot:
+        return TripSnapshot(id=uuid4().hex, request=request, data_mode=data_mode, agent_mode="model")
+
+    def persist(snapshot: TripSnapshot, proposal: Proposal | None) -> None:
+        context.state["travel"] = ConfigRecord({"snapshot": snapshot.model_dump_json(),
+                                                "proposal": proposal.model_dump_json() if proposal else ""})
+
+    for index, (kind, payload) in enumerate(compiled, 1):
+        event = None
+        if kind == "request":
+            current = fresh(payload)
+        elif kind == "plan":
+            current = current or fresh(TripRequest())
+        else:
+            event = payload
+        say(agent, f"\nStep {index} of {len(compiled)}: {event.kind if event else 'initial plan'}"
                    f"{' (simulated scenario)' if event and event.simulated else ''}\n")
         proposal, budget = session.plan(current, event)
         say(agent, summary(proposal, budget) + "\n")
-        if index < len(steps):
+        # Each successful step is persisted at once, so a failure in a later step keeps everything before it.
+        persist(current, proposal)
+        if index < len(compiled):
             if not proposal.proposed.itinerary.validation.valid:
                 say(agent, "The scenario stops here: the proposal has unresolved hard constraints.\n")
                 break
             # Scripted scenario steps commit valid revisions so the next step builds on them.
             current = proposal.proposed
+            persist(current, None)
             say(agent, f"Committed revision {current.revision} to continue the scenario.\n")
-    context.state["travel"] = ConfigRecord({"snapshot": current.model_dump_json(),
-                                            "proposal": proposal.model_dump_json() if proposal else ""})
     done(agent)

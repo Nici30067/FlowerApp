@@ -7,7 +7,6 @@ from travel_agent.providers.services import key
 from travel_agent.schemas import (
     Break,
     Coordinate,
-    DayPlan,
     Issue,
     Itinerary,
     Leg,
@@ -89,7 +88,7 @@ def _visit_start(place: Place, arrival: datetime, duration_s: int, snapshot: Tri
 
 
 def schedule_order(snapshot: TripSnapshot, matrix: dict[str, Leg], order: Iterable[str],
-                   scores: dict[str, float] | None = None) -> DayPlan | None:
+                   scores: dict[str, float] | None = None) -> Itinerary | None:
     """Construct a schedule from an order. Return None on a known hard conflict."""
     req = snapshot.request
     catalog = {p.id: p for p in snapshot.places}
@@ -154,12 +153,12 @@ def schedule_order(snapshot: TripSnapshot, matrix: dict[str, Leg], order: Iterab
     categories = set(c for pid in order for c in catalog[pid].categories)
     score += 1.5 * len(categories & set(req.interests))
     score += len(order) * 2 - travel / 1500 - cost / 20000 - unknown * 0.5
-    return DayPlan(stops=stops, legs=legs, breaks=breaks, end_arrival=now,
-                   walking_m=walking, travel_duration_s=travel, cost_minor=cost,
-                   unknown_cost_count=unknown, score=score)
+    return Itinerary(stops=stops, legs=legs, breaks=breaks, end_arrival=now,
+                     walking_m=walking, travel_duration_s=travel, cost_minor=cost,
+                     unknown_cost_count=unknown, score=score)
 
 
-def validate(snapshot: TripSnapshot, itinerary: DayPlan) -> Validation:
+def validate(snapshot: TripSnapshot, itinerary: Itinerary) -> Validation:
     """Independently inspect the persisted schedule and recompute reported totals."""
     req = snapshot.request
     places = {p.id: p for p in snapshot.places}
@@ -267,17 +266,31 @@ def validate(snapshot: TripSnapshot, itinerary: DayPlan) -> Validation:
                       issues=issues)
 
 
-def search(snapshot: TripSnapshot, matrix: dict[str, Leg], ranking: list[str], beam_width: int = 64) -> DayPlan:
+def candidate_scores(snapshot: TripSnapshot, ranking: list[str], candidates: Iterable[str]) -> dict[str, float]:
+    """Per-stop value: 1 + 3 per matched interest, plus up to 3 for the specialists' rank (0 when unranked)."""
+    catalog = {p.id: p for p in snapshot.places}
+    interests = set(snapshot.request.interests)
+    position = {pid: idx for idx, pid in enumerate(ranking)}
+    scores = {}
+    for pid in candidates:
+        score = 1 + 3 * len(set(catalog[pid].categories) & interests)
+        if pid in position:
+            score += 3 * (len(ranking) - position[pid]) / len(ranking)
+        scores[pid] = score
+    return scores
+
+
+def search(snapshot: TripSnapshot, matrix: dict[str, Leg], ranking: list[str], beam_width: int = 64) -> Itinerary:
     """Bounded beam search. Failure is a search result, not an optimality proof."""
     req = snapshot.request
     completed = set(snapshot.progress.completed_place_ids)
     catalog = {p.id: p for p in snapshot.places}
     required = (set(req.required_place_ids) | {r.place_id for r in req.reservations}) - completed
+    ranking = list(dict.fromkeys(ranking))
+    # Ranked places expand before unranked required ones; a rank bonus is worth as much as one matched interest.
     candidates = [pid for pid in dict.fromkeys(ranking + sorted(required)) if pid in catalog and pid not in completed
                   and pid not in req.excluded_place_ids and pid not in snapshot.closed_place_ids]
-    scores = {pid: 1 + len(set(catalog[pid].categories) & set(req.interests)) * 3
-              + (len(ranking) - ranking.index(pid)) / max(1, len(ranking)) if pid in ranking else 1
-              for pid in candidates}
+    scores = candidate_scores(snapshot, ranking, candidates)
     beams = [()]
     best: Itinerary | None = None
     empty = schedule_order(snapshot, matrix, [])
@@ -303,57 +316,9 @@ def search(snapshot: TripSnapshot, matrix: dict[str, Leg], ranking: list[str], b
         if not beams:
             break
     if best is None:
-        return DayPlan(end_arrival=max(req.start, snapshot.progress.now or req.start),
+        return Itinerary(end_arrival=max(req.start, snapshot.progress.now or req.start),
             validation=Validation(valid=False, status="infeasible", issues=[Issue(code="NO_FEASIBLE_PLAN",
                 severity="error", message="The bounded search found no feasible itinerary. Review required stops, "
                 "reservations, available time, walking limits, budget, weather restrictions, and route availability.")]))
     best.validation = validate(snapshot, best)
     return best
-
-
-def validate_trip(snapshot: TripSnapshot, itinerary: Itinerary) -> Validation:
-    """Trip-level validation: re-validate every day independently (never trusting the
-    worker's own totals), plus cross-day invariants that no single day's `validate()`
-    can see."""
-    req = snapshot.request
-    issues: list[Issue] = []
-
-    def issue(code, message, day_index=None, pid=None, warning=False):
-        issues.append(Issue(code=code, message=message, place_id=pid, day_index=day_index,
-                            severity="warning" if warning else "error"))
-
-    if len(itinerary.days) != req.days:
-        issue("DAY_COUNT_MISMATCH", f"Expected {req.days} day(s), got {len(itinerary.days)}")
-
-    seen_place_ids: dict[str, int] = {}
-    for day in itinerary.days:
-        expected_start, expected_end = req.day_window(day.index)
-        expected_date = expected_start.date().isoformat()
-        if day.date != expected_date:
-            issue("DAY_DATE_MISMATCH", f"Day {day.index} date does not match the trip's calendar",
-                  day_index=day.index)
-        day_snapshot = snapshot.model_copy(update={"request": req.day_request(day.index), "itinerary": day})
-        day_validation = validate(day_snapshot, day)
-        for day_issue in day_validation.issues:
-            issues.append(day_issue.model_copy(update={"day_index": day.index}))
-        for pid in {s.place_id for s in day.stops}:
-            if pid in seen_place_ids:
-                issue("DUPLICATE_STOP_ACROSS_DAYS",
-                      f"{pid} is scheduled on both day {seen_place_ids[pid]} and day {day.index}",
-                      day_index=day.index, pid=pid)
-            else:
-                seen_place_ids[pid] = day.index
-
-    computed_walking = sum(d.walking_m for d in itinerary.days)
-    computed_travel = sum(d.travel_duration_s for d in itinerary.days)
-    computed_cost = sum(d.cost_minor for d in itinerary.days)
-    computed_unknown = sum(d.unknown_cost_count for d in itinerary.days)
-    if (computed_walking != itinerary.walking_m or computed_travel != itinerary.travel_duration_s
-            or computed_cost != itinerary.cost_minor or computed_unknown != itinerary.unknown_cost_count):
-        issue("TRIP_TOTALS_MISMATCH", "Reported trip totals differ from the sum of each day's totals")
-    if computed_cost > req.budget_minor:
-        issue("TRIP_BUDGET_LIMIT", "Whole-trip accounted spending exceeds the budget")
-
-    valid = not any(i.severity == "error" for i in issues)
-    return Validation(valid=valid, status="infeasible" if not valid else "provisional" if issues else "valid",
-                      issues=issues)

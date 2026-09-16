@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "osm-travel-companion"
-version = "0.2.0"
+version = "0.2.3"
 description = "Collaborative travel planning with specialist agents, OpenStreetMap, and validated itinerary revisions."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -46,7 +46,10 @@ model-candidates = ""
 model-timeout-s = 120
 wall-time-s = 900
 # Hard cap on model calls per planning step (SuperGrid credits are charged per call and token).
-max-model-calls = 12
+# 0 = auto: 5 * (max-tool-turns + 2). Set a positive number to override the automatic cap.
+max-model-calls = 0
+# Upper bound on output tokens per model call (Responses API max_output_tokens).
+max-output-tokens = 2000
 # 0 = one bounded model call per specialist (fastest). Up to 10 evidence tool rounds are allowed.
 max-tool-turns = 0
 # Responses API reasoning effort: minimal, low, medium, high, xhigh, or "" to omit the field.

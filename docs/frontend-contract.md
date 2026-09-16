@@ -20,7 +20,7 @@ All `/api/*` routes are JSON. Error bodies are `{"detail": "<text>"}`; FastAPI v
 
 | Method | Path | Purpose | Success | Errors |
 | --- | --- | --- | --- | --- |
-| GET | `/health` | liveness | `{"status": "ok", "version": "0.2.2"}` | |
+| GET | `/health` | liveness | `{"status": "ok", "version": "0.2.3"}` | |
 | GET | `/api/config` | server capabilities and defaults | object, section 6 | |
 | POST | `/api/login` | exchange the operator token for a session cookie | `{"ok": true}` | 401 |
 | GET | `/api/geocode?q=` | resolve a place name | object, section 7 | 400, 404, 503 |
@@ -687,7 +687,7 @@ replaced. Frontend code that still references the removed shapes must change.
 * `travel_agent/settings.py` (one `ModelSettings` for the local model path and the SuperGrid launcher),
   `travel_agent/model_adapter.py` (Chat Completions endpoints such as Gemini behind `TRAVEL_MODEL_API=chat`),
   `scripts/serve_live.sh` (any-city live planning), `scripts/serve_gemini.sh`.
-* API version `0.2.2` (`/health` and the FastAPI title).
+* API version `0.2.3` (`/health` and the FastAPI title).
 
 ### Unchanged and still relied on by the UI
 

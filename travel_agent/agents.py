@@ -244,8 +244,12 @@ class RulesRunner:
         return report
 
 
-def extract_json_object(text: str) -> dict | None:
-    """Locate one JSON object in model text. Prose or code fences around the object are tolerated."""
+def extract_json_object(text: str, key: str = "role") -> dict | None:
+    """Locate one JSON object in model text. Prose or code fences around the object are tolerated.
+
+    `key`, if non-empty, must be present in the parsed dict for it to be accepted (this was
+    originally written for agent reports, which always carry a "role" field). Pass an empty
+    string to accept any JSON object regardless of its keys."""
     text = (text or "").strip()
     fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL)
     decoder = json.JSONDecoder()
@@ -255,7 +259,7 @@ def extract_json_object(text: str) -> dict | None:
                 value, _ = decoder.raw_decode(candidate, start)
             except ValueError:
                 continue
-            if isinstance(value, dict) and "role" in value:
+            if isinstance(value, dict) and (not key or key in value):
                 return value
     return None
 

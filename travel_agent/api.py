@@ -22,7 +22,15 @@ from travel_agent.agents import ExecutionBudget, ModelRunner, RulesRunner, opena
 from travel_agent.coordinator import Coordinator, apply_event
 from travel_agent.flower_backend import FlowerBackend
 from travel_agent.providers.services import ProviderError, make_provider
-from travel_agent.schemas import Contract, IntakeTurn, Proposal, TripEvent, TripRequest, TripSnapshot
+from travel_agent.schemas import (
+    Contract,
+    IntakeTurn,
+    Proposal,
+    TripBrief,
+    TripEvent,
+    TripRequest,
+    TripSnapshot,
+)
 from travel_agent.store import Conflict, NotFound, Store
 
 WEB = Path(__file__).parent / "web"
@@ -44,7 +52,7 @@ class WorkerEvent(Contract):
 
 def create_app(db_path: str | None = None, *, data_mode: str | None = None,
                agent_mode: str | None = None, execution_backend: str | None = None,
-               flower_backend: FlowerBackend | None = None) -> FastAPI:
+               flower_backend: FlowerBackend | None = None, intake_client=None) -> FastAPI:
     store = Store(db_path or os.getenv("TRAVEL_DB", "runtime/travel.sqlite3"))
     data_mode = data_mode or os.getenv("TRAVEL_DATA_MODE", "fixture")
     agent_mode = agent_mode or os.getenv("TRAVEL_AGENT_MODE", "rules")
@@ -203,9 +211,40 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
         job = queue(snapshot)
         return {"trip_id": snapshot.id, "job": job}
 
+    def _intake_model_client():
+        if intake_client is not None:
+            return intake_client
+        if agent_mode != "model":
+            return None
+        try:
+            return openai_client(os.getenv("TRAVEL_MODEL_BASE_URL", ""), os.getenv("TRAVEL_MODEL_API_KEY", ""), 20.0)
+        except Exception:
+            return None
+
     @app.post("/api/intake")
     def intake_turn(body: IntakeTurn):
         brief = intake.parse(body.message, body.brief)
+        engine = "rules"
+        client = _intake_model_client()
+        if client is not None:
+            model_brief = intake.enrich_with_model(
+                body.message, body.brief, body.history, client, os.getenv("TRAVEL_MODEL", ""), timeout_s=20)
+            if model_brief is not None:
+                # Merge policy: field-by-field, prefer the model's non-null/non-empty value
+                # (it merged onto the pre-turn brief already, so it reflects both prior state
+                # and the new message); fall back to the rules parser's value otherwise. The
+                # rules parser remains the floor whenever the model omits or fails a field.
+                rules_data = brief.model_dump()
+                model_data = model_brief.model_dump()
+                merged = dict(rules_data)
+                contributed = False
+                for key, value in model_data.items():
+                    if value not in (None, [], "") and merged.get(key) != value:
+                        merged[key] = value
+                        contributed = True
+                brief = TripBrief(**merged)
+                if contributed:
+                    engine = "model"
         missing = intake.missing_fields(brief)
         notes: list[str] = []
         ready = False
@@ -221,7 +260,7 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
         else:
             reply = intake.next_question(brief) or ""
         return {"reply": reply, "brief": brief.model_dump(mode="json"), "missing": missing, "ready": ready,
-                "request": request.model_dump(mode="json") if request else None, "engine": "rules", "notes": notes}
+                "request": request.model_dump(mode="json") if request else None, "engine": engine, "notes": notes}
 
     @app.get("/api/trips")
     def list_trips():

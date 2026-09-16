@@ -1,7 +1,8 @@
 'use strict';
 const $ = (id) => document.getElementById(id);
 const state = {config:null, trip:null, proposal:null, busy:false, events:[], selectedInterests:new Set(),
-  origin:null, destination:null, map:null, layer:null, selecting:null, stream:null, command:null};
+  origin:null, destination:null, map:null, layer:null, selecting:null, stream:null, command:null,
+  brief:{}, chatHistory:[], chatBusy:false, selectedDay:0};
 const ROLES = {
   discovery: ['Discovery', 'Places and personal interests', '⌕'],
   conditions: ['Conditions', 'Weather and activity exposure', '☂'],
@@ -80,9 +81,27 @@ function buildRequest() {
   return {...base,title:$('trip-title').value,city:$('city').value,timezone:$('timezone').value,
     start:zonedISO($('trip-date').value,$('start-time').value,$('timezone').value),
     end:zonedISO($('trip-date').value,$('end-time').value,$('timezone').value),
+    days:(!state.trip&&state.brief?.days)?state.brief.days:base.days,
     origin:state.origin,destination:state.destination,interests:[...state.selectedInterests],
     budget_minor:Math.round(Number($('budget').value)*100),max_walking_m:Math.round(Number($('walking').value)*1000),
     transport_mode:$('transport').value,target_stops:+$('stops').value,avoid_rain_outdoor_visits:$('avoid-rain').checked};
+}
+function briefToRequestFields(brief) {
+  const merged=buildRequest();
+  const tz=brief.timezone||merged.timezone;
+  if(brief.city)merged.city=brief.city;
+  if(brief.title)merged.title=brief.title;
+  if(brief.timezone)merged.timezone=brief.timezone;
+  if(brief.date&&brief.start_time)merged.start=zonedISO(brief.date,brief.start_time,tz);
+  if(brief.date&&brief.end_time)merged.end=zonedISO(brief.date,brief.end_time,tz);
+  if(brief.budget_minor!=null)merged.budget_minor=brief.budget_minor;
+  if(brief.max_walking_m!=null)merged.max_walking_m=brief.max_walking_m;
+  if(brief.transport_mode)merged.transport_mode=brief.transport_mode;
+  if(brief.target_stops!=null)merged.target_stops=brief.target_stops;
+  if(brief.avoid_rain_outdoor_visits!=null)merged.avoid_rain_outdoor_visits=brief.avoid_rain_outdoor_visits;
+  if(brief.interests&&brief.interests.length)merged.interests=[...brief.interests];
+  if(brief.days!=null)merged.days=brief.days;
+  return merged;
 }
 function busy(value,label='Planning') {
   state.busy=value;$('build-button').disabled=value;
@@ -106,7 +125,7 @@ function addEvent(event) {
     const n=$('agent-'+d.role);if(n){n.classList.remove('running');n.classList.add('done');}
     const item=node('div','feed-event');item.append(node('strong','',ROLES[d.role][0]),node('p','',d.report.summary));$('event-feed').append(item);
   }
-  if(event.type==='collaboration.message' && d.kind==='request') {
+  if(event.type==='collaboration.message' && (d.kind==='request' || d.recipient==='user')) {
     const item=node('div','feed-event handoff');item.append(node('strong','',`${d.sender.toUpperCase()} > ${d.recipient.toUpperCase()}`),node('p','',d.summary));$('event-feed').append(item);
   }
   if(event.type==='agent.completed'&&d.report) {
@@ -196,40 +215,63 @@ function render() {
   const trip=view(), plan=trip?.itinerary;
   $('itinerary-title').textContent=trip?.request.title||'Explore Berlin, together.';
   $('revision').textContent=state.proposal?`PROPOSED R${trip.revision}`:trip?`REVISION ${trip.revision}`:'DRAFT';
-  $('metric-stops').textContent=plan?.stops.length||0;
+  const totalStops=(plan?.days||[]).reduce((n,d)=>n+d.stops.length,0);
+  $('metric-stops').textContent=totalStops||0;
   $('metric-walk').replaceChildren(document.createTextNode(((plan?.walking_m||0)/1000).toFixed(1)+' '),node('small','','km'));
   $('metric-cost').replaceChildren(document.createTextNode(((plan?.cost_minor||0)/100).toFixed(2)+' '),node('small','',trip?.request.currency||'EUR'));
-  $('metric-end').textContent=time(plan?.end_arrival||trip?.request.end||state.config?.default_request.end);
+  const lastDay=plan?.days?.at(-1);
+  $('metric-end').textContent=time(lastDay?.end_arrival||trip?.request.end||state.config?.default_request.end);
   $('export-button').disabled=!state.trip?.itinerary;
-  renderTimeline();renderReview();renderMap();busy(state.busy);
+  if(plan?.days&&state.selectedDay>=plan.days.length)state.selectedDay=0;
+  renderDayTabs();renderTimeline();renderReview();renderMap();busy(state.busy);
+}
+function renderDayTabs() {
+  const trip=view(),plan=trip?.itinerary,days=plan?.days||[];
+  const tabs=$('day-tabs');tabs.replaceChildren();
+  if(days.length<2){tabs.hidden=true;return;}
+  tabs.hidden=false;
+  days.forEach((day,i)=>{
+    const b=button(`Day ${i+1}`,'day-tab',()=>{state.selectedDay=i;renderDayTabs();renderMap();});
+    b.classList.toggle('active',i===state.selectedDay);tabs.append(b);
+  });
 }
 function renderTimeline() {
   const trip=view(),plan=trip?.itinerary;if(!plan)return;
   $('timeline').replaceChildren();
-  if(!plan.stops.length){$('timeline').append(node('div','empty-timeline','No feasible schedule was found under the current constraints.'));return;}
-  plan.stops.forEach((stop,index)=>{
-    const leg=plan.legs[index];
-    if(leg)$('timeline').append(node('div','transfer-row',`${leg.mode==='walking'?'Walk':'Cycle'} ${Math.ceil(leg.duration_s/60)} min · ${leg.distance_m} m${leg.source_status==='fixture'?' · synthetic route':''}`));
-    const card=node('article','timeline-card');
-    card.append(node('div','stop-index'+(stop.completed?' completed':''),stop.completed?'✓':String(index+1)));
-    const content=node('div');content.append(node('div','stop-time',`${time(stop.start)} to ${time(stop.end)}`));
-    const title=node('div','stop-title',stop.name);title.onclick=()=>showPlace(stop.place_id);title.tabIndex=0;title.onkeydown=e=>{if(e.key==='Enter')showPlace(stop.place_id);};
-    if(stop.locked)title.append(node('span','stop-tag locked','LOCKED'));
-    if(stop.completed)title.append(node('span','stop-tag','COMPLETED'));
-    const price=stop.cost_minor===null?'Price unknown':formatMoney(stop.cost_minor,trip.request.currency);
-    const place=trip.places.find(p=>p.id===stop.place_id);
-    content.append(title,node('div','stop-meta',`${place?.indoor===true?'Indoor':place?.indoor===false?'Outdoor':'Exposure unknown'} · ${Math.round((new Date(stop.end)-new Date(stop.start))/60000)} min · ${price}`));
-    card.append(content);const actions=node('div','stop-actions');
-    if(!stop.completed&&!state.proposal) {
-      actions.append(button(stop.locked?'Unlock':'Lock time','stop-action',()=>event(stop.locked?'unlock_stop':'lock_stop',{place_id:stop.place_id})));
-      actions.append(button('Replace','stop-action',()=>event('preferences_changed',{excluded_place_ids:[...state.trip.request.excluded_place_ids,stop.place_id]})));
-      if(index===state.trip.progress.completed_place_ids.length)actions.append(button('Complete','stop-action',()=>completeStop(stop)));
-    }
-    card.append(actions);$('timeline').append(card);
-    const pause=plan.breaks.find(b=>b.location_id===stop.place_id&&new Date(b.start)>=new Date(stop.end));
-    if(pause)$('timeline').append(node('div','transfer-row',`Break ${time(pause.start)} to ${time(pause.end)} · ${pause.reason}`));
+  const days=plan.days||[];
+  if(!days.some(d=>d.stops.length)){$('timeline').append(node('div','empty-timeline','No feasible schedule was found under the current constraints.'));return;}
+  days.forEach(day=>{
+    const section=node('section','day-section');
+    const heading=node('div','day-section-heading');
+    heading.append(node('strong','',`Day ${day.index+1} · ${day.date}`),
+      node('span','',`${day.stops.length} stop${day.stops.length===1?'':'s'} · ${(day.walking_m/1000).toFixed(1)} km · ${formatMoney(day.cost_minor,trip.request.currency)}`));
+    section.append(heading);
+    const completedBefore=day.stops.filter(s=>s.completed).length;
+    day.stops.forEach((stop,index)=>{
+      const leg=day.legs[index];
+      if(leg)section.append(node('div','transfer-row',`${leg.mode==='walking'?'Walk':'Cycle'} ${Math.ceil(leg.duration_s/60)} min · ${leg.distance_m} m${leg.source_status==='fixture'?' · synthetic route':''}`));
+      const card=node('article','timeline-card');
+      card.append(node('div','stop-index'+(stop.completed?' completed':''),stop.completed?'✓':String(index+1)));
+      const content=node('div');content.append(node('div','stop-time',`${time(stop.start)} to ${time(stop.end)}`));
+      const title=node('div','stop-title',stop.name);title.onclick=()=>showPlace(stop.place_id);title.tabIndex=0;title.onkeydown=e=>{if(e.key==='Enter')showPlace(stop.place_id);};
+      if(stop.locked)title.append(node('span','stop-tag locked','LOCKED'));
+      if(stop.completed)title.append(node('span','stop-tag','COMPLETED'));
+      const price=stop.cost_minor===null?'Price unknown':formatMoney(stop.cost_minor,trip.request.currency);
+      const place=trip.places.find(p=>p.id===stop.place_id);
+      content.append(title,node('div','stop-meta',`${place?.indoor===true?'Indoor':place?.indoor===false?'Outdoor':'Exposure unknown'} · ${Math.round((new Date(stop.end)-new Date(stop.start))/60000)} min · ${price}`));
+      card.append(content);const actions=node('div','stop-actions');
+      if(!stop.completed&&!state.proposal&&day.index===0) {
+        actions.append(button(stop.locked?'Unlock':'Lock time','stop-action',()=>event(stop.locked?'unlock_stop':'lock_stop',{place_id:stop.place_id})));
+        actions.append(button('Replace','stop-action',()=>event('preferences_changed',{excluded_place_ids:[...state.trip.request.excluded_place_ids,stop.place_id]})));
+        if(index===state.trip.progress.completed_place_ids.length)actions.append(button('Complete','stop-action',()=>completeStop(stop)));
+      }
+      card.append(actions);section.append(card);
+      const pause=day.breaks.find(b=>b.location_id===stop.place_id&&new Date(b.start)>=new Date(stop.end));
+      if(pause)section.append(node('div','transfer-row',`Break ${time(pause.start)} to ${time(pause.end)} · ${pause.reason}`));
+    });
+    const last=day.legs.at(-1);if(last)section.append(node('div','transfer-row',`${Math.ceil(last.duration_s/60)} min ${last.mode} to finish · arrival ${time(day.end_arrival)}`));
+    $('timeline').append(section);
   });
-  const last=plan.legs.at(-1);if(last)$('timeline').append(node('div','transfer-row',`${Math.ceil(last.duration_s/60)} min ${last.mode} to finish · arrival ${time(plan.end_arrival)}`));
 }
 function completeStop(stop) {
   const amount=prompt(`Actual spending at ${stop.name}, in ${state.trip.request.currency}:`,String((stop.cost_minor||0)/100));
@@ -285,6 +327,9 @@ function showPlace(id) {
 }
 const SVGNS='http://www.w3.org/2000/svg';
 function svg(tag,attrs={},text) {const e=document.createElementNS(SVGNS,tag);for(const[k,v]of Object.entries(attrs))e.setAttribute(k,String(v));if(text!==undefined)e.textContent=text;return e;}
+function selectedDayPlan() {
+  const trip=view();return trip?.itinerary?.days?.[state.selectedDay]||null;
+}
 function bounds() {
   const trip=view();const points=[state.origin||state.config.default_request.origin,state.destination||state.config.default_request.destination,...(trip?.places||[]).map(p=>p.coordinate)];
   let minLon=Math.min(...points.map(p=>p.lon)),maxLon=Math.max(...points.map(p=>p.lon));
@@ -306,8 +351,9 @@ function renderMap() {
     for(const l of legs||[]){if(!l.geometry?.length)continue;const pts=l.geometry.map(([lon,lat])=>xy({lat,lon}).join(',')).join(' ');
       s.append(svg('polyline',{points:pts,fill:'none',stroke:old?'#c2ab8a':'#ba5a34','stroke-width':old?5:3,'stroke-linecap':'round','stroke-linejoin':'round','stroke-dasharray':l.source_status==='fixture'?'7 6':'none',opacity:old?.45:.9}));}
   }
-  if(state.proposal)route(state.trip?.itinerary?.legs,true);route(trip?.itinerary?.legs);
-  const active=new Map((trip?.itinerary?.stops||[]).map((s,i)=>[s.place_id,i+1]));
+  const oldDay=state.trip?.itinerary?.days?.[state.selectedDay];
+  if(state.proposal)route(oldDay?.legs,true);route(selectedDayPlan()?.legs);
+  const active=new Map((selectedDayPlan()?.stops||[]).map((s,i)=>[s.place_id,i+1]));
   for(const p of trip?.places||[]) {
     const [x,y]=xy(p.coordinate),index=active.get(p.id);const g=svg('g',{tabindex:0,role:'button','aria-label':p.name,style:'cursor:pointer'});
     g.onclick=()=>showPlace(p.id);g.onkeydown=e=>{if(e.key==='Enter')showPlace(p.id);};
@@ -334,11 +380,11 @@ function renderMap() {
 }
 function renderLeaflet() {
   const L=window.L,trip=view();state.layer.clearLayers();let box=[];
-  for(const l of trip?.itinerary?.legs||[]) {
+  for(const l of selectedDayPlan()?.legs||[]) {
     if(l.geometry.length>1)L.geoJSON({type:'Feature',properties:{},geometry:{type:'LineString',coordinates:l.geometry}},
       {style:{color:'#ba5a34',weight:4,dashArray:l.source_status==='fixture'?'8 7':null}}).addTo(state.layer);
   }
-  const active=new Map((trip?.itinerary?.stops||[]).map((s,i)=>[s.place_id,i+1]));
+  const active=new Map((selectedDayPlan()?.stops||[]).map((s,i)=>[s.place_id,i+1]));
   for(const p of trip?.places||[]) {
     const n=active.get(p.id);const latlng=[p.coordinate.lat,p.coordinate.lon];box.push(latlng);
     const icon=L.divIcon({className:'leaflet-div-icon',html:`<span class="map-marker${n?'':' candidate'}">${n||''}</span>`,iconSize:[30,30],iconAnchor:[15,15]});
@@ -369,6 +415,43 @@ function pickLocation(coordinate) {
   if(state.trip){event('preferences_changed',{[kind]:coordinate});}
   else{state[kind]=coordinate;renderMap();}
   $('endpoint-text').textContent=`${kind==='origin'?'Start':'Finish'}: ${coordinate.lat.toFixed(4)}, ${coordinate.lon.toFixed(4)}`;
+}
+function appendChatTurn(role,text) {
+  const item=node('div','chat-turn '+role,text);$('chat-log').append(item);$('chat-log').scrollTop=$('chat-log').scrollHeight;
+  return item;
+}
+function tryBuildFromChat() {
+  if(state.trip?.itinerary) {
+    const req=briefToRequestFields(state.brief);
+    const changedCity=req.city!==state.trip.request.city;
+    const changedPeriod=req.start!==new Date(state.trip.request.start).toISOString()||req.end!==new Date(state.trip.request.end).toISOString();
+    if(changedCity||changedPeriod) {
+      appendChatTurn('assistant','That would change the date, time window, or city of an existing trip — choose New trip to start a fresh one.');
+      return;
+    }
+  }
+  $('trip-form').requestSubmit();
+}
+async function chatTurn(text) {
+  if(!text.trim()||state.chatBusy)return;
+  appendChatTurn('user',text);state.chatHistory.push({role:'user',text});
+  $('chat-note').textContent='';state.chatBusy=true;$('chat-send').disabled=true;
+  try {
+    const data=await post('/api/intake',{message:text,brief:state.brief,history:state.chatHistory.slice(-20)});
+    state.brief=data.brief;
+    if(data.reply) {
+      appendChatTurn('assistant',data.reply);state.chatHistory.push({role:'assistant',text:data.reply});
+    }
+    syncForm(briefToRequestFields(state.brief));
+    for(const note of data.notes||[])$('chat-note').textContent=note;
+    if(data.ready&&data.request) {
+      const chip=node('button','chat-build-chip','Build itinerary ↗');chip.type='button';
+      chip.onclick=()=>{chip.disabled=true;tryBuildFromChat();};
+      $('chat-log').append(chip);$('chat-log').scrollTop=$('chat-log').scrollHeight;
+      $('details-panel').open=false;
+    }
+  }catch(e){toast(e.message,true);}
+  finally{state.chatBusy=false;$('chat-send').disabled=false;}
 }
 async function boot() {
   state.config=await api('/api/config');
@@ -416,4 +499,5 @@ $('import-file').onchange=async e=>{try{const file=e.target.files[0];if(!file)re
 }catch(e){toast(e.message,true);}};
 $('copy-command').onclick=async()=>{try{await navigator.clipboard.writeText(state.command);toast('Private job command copied.');}catch{toast('Select and copy the command manually.');}};
 $('login-form').onsubmit=async e=>{e.preventDefault();try{await post('/api/login',{token:$('login-token').value});$('login-token').value='';$('login-dialog').close();await boot();}catch(e){$('login-error').textContent=e.message;}};
+$('chat-form').onsubmit=e=>{e.preventDefault();const text=$('chat-input').value;$('chat-input').value='';chatTurn(text);};
 boot().catch(e=>toast(e.message,true));

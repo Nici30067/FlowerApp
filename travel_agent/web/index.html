@@ -17,28 +17,45 @@
   <div class="notice-bar" id="notice-bar">Synthetic demonstration data. No bookings or payments are made.</div>
   <main class="workspace">
     <div class="thread">
+      <section class="bubble chat-intake" id="chat-intake">
+        <div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">TELL ME ABOUT YOUR TRIP</div><h1>Let's plan your day.</h1></div></div>
+        <p class="subtle intro">Describe your trip in plain language — I'll fill in the details as we go.</p>
+        <div class="chat-log" id="chat-log" aria-live="polite"></div>
+        <form id="chat-form">
+          <label class="sr-only" for="chat-input">Message</label>
+          <div class="input-row chat-input-row">
+            <input id="chat-input" type="text" maxlength="600" placeholder="e.g. Two days in Berlin next Friday, mostly art and coffee" autocomplete="off">
+            <button class="primary" type="submit" id="chat-send">Send</button>
+          </div>
+        </form>
+        <p class="micro" id="chat-note"></p>
+      </section>
+
       <section class="bubble preferences">
         <div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">YOUR DAY, YOUR CONSTRAINTS</div><h1>Make room for the day.</h1></div></div>
         <p class="subtle intro">One itinerary. Four specialists. Every change is yours to review.</p>
-        <form id="trip-form">
-          <label>Trip name<input id="trip-title" value="A day in Berlin" maxlength="120" required></label>
-          <div class="input-row"><label>City<input id="city" value="Berlin" required></label><label>Date<input id="trip-date" type="date" required></label></div>
-          <div class="input-row"><label>From<input id="start-time" type="time" value="10:00" required></label><label>Until<input id="end-time" type="time" value="17:00" required></label></div>
-          <label>Timezone<input id="timezone" value="Europe/Berlin" required></label>
-          <div class="section-rule"></div>
-          <div class="label-row"><label for="budget">Budget</label><span id="budget-label">EUR 60</span></div>
-          <input id="budget" type="range" min="0" max="150" value="60" step="5">
-          <div class="label-row"><label for="walking">Walking limit</label><span id="walking-label">5.0 km</span></div>
-          <input id="walking" type="range" min="0.3" max="10" value="5" step="0.1">
-          <div class="input-row"><label>Transport<select id="transport"><option value="walking">Walking</option><option value="cycling">Cycling</option></select></label><label>Target stops<select id="stops"><option>3</option><option>4</option><option selected>5</option><option>6</option></select></label></div>
-          <fieldset><legend>Interests</legend><div class="interest-grid" id="interests"></div></fieldset>
-          <div class="section-rule"></div>
-          <label class="check-label"><input type="checkbox" id="avoid-rain" checked><span>Avoid outdoor visits in rain</span></label>
-          <p class="micro">Rain threshold: 60%. Travel between indoor stops may still be outdoors.</p>
-          <button class="primary wide" type="submit" id="build-button">Build itinerary <span aria-hidden="true">↗</span></button>
-          <p class="micro" id="engine-note">Local fixture replay uses deterministic specialist policies. Model calls: 0.</p>
-        </form>
-        <div class="endpoint-box"><div class="eyebrow">MAP SELECTION</div><p id="endpoint-text">Start and finish: Hackescher Markt</p><div class="button-pair"><button id="set-start" class="small-button">Set start</button><button id="set-end" class="small-button">Set finish</button></div></div>
+        <details id="details-panel" open>
+          <summary>Trip details</summary>
+          <form id="trip-form">
+            <label>Trip name<input id="trip-title" value="A day in Berlin" maxlength="120" required></label>
+            <div class="input-row"><label>City<input id="city" value="Berlin" required></label><label>Date<input id="trip-date" type="date" required></label></div>
+            <div class="input-row"><label>From<input id="start-time" type="time" value="10:00" required></label><label>Until<input id="end-time" type="time" value="17:00" required></label></div>
+            <label>Timezone<input id="timezone" value="Europe/Berlin" required></label>
+            <div class="section-rule"></div>
+            <div class="label-row"><label for="budget">Budget</label><span id="budget-label">EUR 60</span></div>
+            <input id="budget" type="range" min="0" max="150" value="60" step="5">
+            <div class="label-row"><label for="walking">Walking limit</label><span id="walking-label">5.0 km</span></div>
+            <input id="walking" type="range" min="0.3" max="10" value="5" step="0.1">
+            <div class="input-row"><label>Transport<select id="transport"><option value="walking">Walking</option><option value="cycling">Cycling</option></select></label><label>Target stops<select id="stops"><option>3</option><option>4</option><option selected>5</option><option>6</option></select></label></div>
+            <fieldset><legend>Interests</legend><div class="interest-grid" id="interests"></div></fieldset>
+            <div class="section-rule"></div>
+            <label class="check-label"><input type="checkbox" id="avoid-rain" checked><span>Avoid outdoor visits in rain</span></label>
+            <p class="micro">Rain threshold: 60%. Travel between indoor stops may still be outdoors.</p>
+            <button class="primary wide" type="submit" id="build-button">Build itinerary <span aria-hidden="true">↗</span></button>
+            <p class="micro" id="engine-note">Local fixture replay uses deterministic specialist policies. Model calls: 0.</p>
+          </form>
+          <div class="endpoint-box"><div class="eyebrow">MAP SELECTION</div><p id="endpoint-text">Start and finish: Hackescher Markt</p><div class="button-pair"><button id="set-start" class="small-button">Set start</button><button id="set-end" class="small-button">Set finish</button></div></div>
+        </details>
       </section>
 
       <section class="bubble flower-panel" id="flower-panel" hidden>
@@ -82,6 +99,7 @@
     <aside class="map-column">
       <div class="map-shell">
         <div class="map-top"><span class="map-label" id="map-label">COORDINATE SCHEMATIC</span><button id="load-osm" class="small-button">Load OSM map</button></div>
+        <div class="day-tabs" id="day-tabs" hidden></div>
         <div id="map" role="region" aria-label="Itinerary map"><svg id="schematic" viewBox="0 0 900 590" aria-label="Offline coordinate schematic"></svg></div>
         <div class="map-bottom"><span id="route-label">Create a trip to display places and routes.</span><span>Geographic view <span aria-hidden="true">↗</span></span></div>
         <div class="map-selection" id="map-selection" hidden>Click the map to choose a location. <button id="cancel-selection">Cancel</button></div>

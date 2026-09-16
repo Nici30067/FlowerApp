@@ -20,6 +20,12 @@ def test_single_message_captures_most_fields():
     assert intake.missing_fields(brief) == ["time_window"]
 
 
+def test_word_form_day_counts_are_parsed():
+    assert intake.parse("Two days in Berlin", TripBrief(), now=NOW).days == 2
+    assert intake.parse("a day trip to Berlin", TripBrief(), now=NOW).days == 1
+    assert intake.parse("five nights in Berlin", TripBrief(), now=NOW).days == 5
+
+
 def test_multi_turn_convergence():
     brief = TripBrief()
     assert intake.next_question(brief) is not None

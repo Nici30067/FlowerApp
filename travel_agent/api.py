@@ -138,7 +138,7 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
         yield
         pool.shutdown(wait=True)
 
-    app = FastAPI(title="OSM Travel Companion", version="0.2.3", lifespan=lifespan)
+    app = FastAPI(title="OSM Travel Companion", version="0.3.1", lifespan=lifespan)
     app.state.store = store
 
     @app.exception_handler(Conflict)
@@ -182,7 +182,7 @@ def create_app(db_path: str | None = None, *, data_mode: str | None = None,
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "version": "0.2.3"}
+        return {"status": "ok", "version": "0.3.1"}
 
     @app.get("/api/config")
     def config():

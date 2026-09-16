@@ -16,63 +16,76 @@
   </header>
   <div class="notice-bar" id="notice-bar">Synthetic demonstration data. No bookings or payments are made.</div>
   <main class="workspace">
-    <aside class="preferences panel">
-      <div class="eyebrow">YOUR DAY, YOUR CONSTRAINTS</div>
-      <h1>Make room<br>for the day.</h1>
-      <p class="subtle intro">One itinerary. Four specialists.<br>Every change is yours to review.</p>
-      <form id="trip-form">
-        <label>Trip name<input id="trip-title" value="A day in Berlin" maxlength="120" required></label>
-        <div class="input-row"><label>City<input id="city" value="Berlin" required></label><label>Date<input id="trip-date" type="date" required></label></div>
-        <div class="input-row"><label>From<input id="start-time" type="time" value="10:00" required></label><label>Until<input id="end-time" type="time" value="17:00" required></label></div>
-        <label>Timezone<input id="timezone" value="Europe/Berlin" required></label>
-        <div class="section-rule"></div>
-        <div class="label-row"><label for="budget">Budget</label><span id="budget-label">EUR 60</span></div>
-        <input id="budget" type="range" min="0" max="150" value="60" step="5">
-        <div class="label-row"><label for="walking">Walking limit</label><span id="walking-label">5.0 km</span></div>
-        <input id="walking" type="range" min="0.3" max="10" value="5" step="0.1">
-        <div class="input-row"><label>Transport<select id="transport"><option value="walking">Walking</option><option value="cycling">Cycling</option></select></label><label>Target stops<select id="stops"><option>3</option><option>4</option><option selected>5</option><option>6</option></select></label></div>
-        <fieldset><legend>Interests</legend><div class="interest-grid" id="interests"></div></fieldset>
-        <div class="section-rule"></div>
-        <label class="check-label"><input type="checkbox" id="avoid-rain" checked><span>Avoid outdoor visits in rain</span></label>
-        <p class="micro">Rain threshold: 60%. Travel between indoor stops may still be outdoors.</p>
-        <button class="primary wide" type="submit" id="build-button">Build itinerary <span aria-hidden="true">↗</span></button>
-        <p class="micro" id="engine-note">Local fixture replay uses deterministic specialist policies. Model calls: 0.</p>
-      </form>
-      <div class="endpoint-box"><div class="eyebrow">MAP SELECTION</div><p id="endpoint-text">Start and finish: Hackescher Markt</p><div class="button-pair"><button id="set-start" class="small-button">Set start</button><button id="set-end" class="small-button">Set finish</button></div></div>
-    </aside>
-    <section class="main-column">
-      <div class="section-heading"><div><div class="eyebrow">THE ITINERARY</div><h2 id="itinerary-title">Explore Berlin, together.</h2></div><span class="revision-badge" id="revision">DRAFT</span></div>
-      <div class="metrics" id="metrics">
-        <div><span>PLANNED STOPS</span><strong id="metric-stops">0</strong></div>
-        <div><span>WALKING</span><strong id="metric-walk">0.0 <small>km</small></strong></div>
-        <div><span>ACCOUNTED COST</span><strong id="metric-cost">0 <small>EUR</small></strong></div>
-        <div><span>FINISH BY</span><strong id="metric-end">17:00</strong></div>
-      </div>
+    <div class="thread">
+      <section class="bubble preferences">
+        <div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">YOUR DAY, YOUR CONSTRAINTS</div><h1>Make room for the day.</h1></div></div>
+        <p class="subtle intro">One itinerary. Four specialists. Every change is yours to review.</p>
+        <form id="trip-form">
+          <label>Trip name<input id="trip-title" value="A day in Berlin" maxlength="120" required></label>
+          <div class="input-row"><label>City<input id="city" value="Berlin" required></label><label>Date<input id="trip-date" type="date" required></label></div>
+          <div class="input-row"><label>From<input id="start-time" type="time" value="10:00" required></label><label>Until<input id="end-time" type="time" value="17:00" required></label></div>
+          <label>Timezone<input id="timezone" value="Europe/Berlin" required></label>
+          <div class="section-rule"></div>
+          <div class="label-row"><label for="budget">Budget</label><span id="budget-label">EUR 60</span></div>
+          <input id="budget" type="range" min="0" max="150" value="60" step="5">
+          <div class="label-row"><label for="walking">Walking limit</label><span id="walking-label">5.0 km</span></div>
+          <input id="walking" type="range" min="0.3" max="10" value="5" step="0.1">
+          <div class="input-row"><label>Transport<select id="transport"><option value="walking">Walking</option><option value="cycling">Cycling</option></select></label><label>Target stops<select id="stops"><option>3</option><option>4</option><option selected>5</option><option>6</option></select></label></div>
+          <fieldset><legend>Interests</legend><div class="interest-grid" id="interests"></div></fieldset>
+          <div class="section-rule"></div>
+          <label class="check-label"><input type="checkbox" id="avoid-rain" checked><span>Avoid outdoor visits in rain</span></label>
+          <p class="micro">Rain threshold: 60%. Travel between indoor stops may still be outdoors.</p>
+          <button class="primary wide" type="submit" id="build-button">Build itinerary <span aria-hidden="true">↗</span></button>
+          <p class="micro" id="engine-note">Local fixture replay uses deterministic specialist policies. Model calls: 0.</p>
+        </form>
+        <div class="endpoint-box"><div class="eyebrow">MAP SELECTION</div><p id="endpoint-text">Start and finish: Hackescher Markt</p><div class="button-pair"><button id="set-start" class="small-button">Set start</button><button id="set-end" class="small-button">Set finish</button></div></div>
+      </section>
+
+      <section class="bubble flower-panel" id="flower-panel" hidden>
+        <div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">FLOWER SUPERGRID</div><h3 id="flower-title">Planning on SuperGrid</h3></div></div>
+        <p class="micro" id="flower-note">Submitting the job as a Flower AgentApp run.</p>
+        <div class="run-metrics" id="flower-run" hidden></div>
+        <pre id="flower-command" hidden></pre>
+        <button id="copy-command" class="small-button" hidden>Copy command</button>
+      </section>
+
+      <section class="bubble collaboration-panel">
+        <div class="panel-heading"><div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">SHARED ITINERARY STATE</div><h2>Agent collaboration</h2></div></div><span class="live-indicator" id="job-state">Ready</span></div>
+        <p class="subtle small">Specialists exchange structured findings. Application code checks the schedule.</p>
+        <div class="agent-list" id="agent-list"></div>
+        <div class="run-metrics" id="run-metrics">No planning run yet.</div>
+        <div class="event-feed" id="event-feed" aria-live="polite"><p class="micro">Execution events and inter-agent requests will appear during planning.</p></div>
+      </section>
+
+      <section class="bubble main-column">
+        <div class="panel-heading"><div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">THE ITINERARY</div><h2 id="itinerary-title">Explore Berlin, together.</h2></div></div><span class="revision-badge" id="revision">DRAFT</span></div>
+        <div class="metrics" id="metrics">
+          <div><span>PLANNED STOPS</span><strong id="metric-stops">0</strong></div>
+          <div><span>WALKING</span><strong id="metric-walk">0.0 <small>km</small></strong></div>
+          <div><span>ACCOUNTED COST</span><strong id="metric-cost">0 <small>EUR</small></strong></div>
+          <div><span>FINISH BY</span><strong id="metric-end">17:00</strong></div>
+        </div>
+        <div class="scenario-bar"><div><span class="eyebrow">ADAPT THE PLAN</span><small>Explicit changes, inspectable revisions.</small></div><button class="scenario-button" id="rain" disabled>☂ Simulate rain</button><button class="scenario-button" id="less-walking" disabled>Reduce walking</button><button class="scenario-button" id="refresh" disabled>Refresh conditions</button></div>
+        <div class="section-heading timeline-heading"><h2>Your timeline</h2><div><button class="text-button" id="import-button">Import JSON</button><button class="text-button" id="export-button" disabled>Export JSON</button></div></div>
+        <input id="import-file" type="file" accept="application/json" hidden>
+        <div class="timeline" id="timeline"><div class="empty-timeline"><div class="empty-icon">◎</div><h3>A day with a clear plan.</h3><p>Set your preferences and build an itinerary.<br>The specialists will share findings here.</p></div></div>
+      </section>
+
+      <section class="bubble review-panel" id="review-panel">
+        <div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">REVIEW BEFORE APPLYING</div><h2>Changes &amp; evidence</h2></div></div>
+        <div id="review-content"><div class="review-empty"><span class="review-symbol">◇</span><p>The current itinerary stays unchanged<br>until you accept a proposed revision.</p></div></div>
+      </section>
+
+      <footer class="sidebar-footer">OpenStreetMap data with attribution. Flower-compatible agent orchestration. No booking, payment, or cancellation tools.</footer>
+    </div>
+
+    <aside class="map-column">
       <div class="map-shell">
         <div class="map-top"><span class="map-label" id="map-label">COORDINATE SCHEMATIC</span><button id="load-osm" class="small-button">Load OSM map</button></div>
         <div id="map" role="region" aria-label="Itinerary map"><svg id="schematic" viewBox="0 0 900 590" aria-label="Offline coordinate schematic"></svg></div>
         <div class="map-bottom"><span id="route-label">Create a trip to display places and routes.</span><span>Geographic view <span aria-hidden="true">↗</span></span></div>
         <div class="map-selection" id="map-selection" hidden>Click the map to choose a location. <button id="cancel-selection">Cancel</button></div>
       </div>
-      <div class="scenario-bar"><div><span class="eyebrow">ADAPT THE PLAN</span><small>Explicit changes, inspectable revisions.</small></div><button class="scenario-button" id="rain" disabled>☂ Simulate rain</button><button class="scenario-button" id="less-walking" disabled>Reduce walking</button><button class="scenario-button" id="refresh" disabled>Refresh conditions</button></div>
-      <div class="section-heading timeline-heading"><h2>Your timeline</h2><div><button class="text-button" id="import-button">Import JSON</button><button class="text-button" id="export-button" disabled>Export JSON</button></div></div>
-      <input id="import-file" type="file" accept="application/json" hidden>
-      <div class="timeline" id="timeline"><div class="empty-timeline"><div class="empty-icon">◎</div><h3>A day with a clear plan.</h3><p>Set your preferences and build an itinerary.<br>The specialists will share findings here.</p></div></div>
-    </section>
-    <aside class="activity-column">
-      <section class="panel collaboration-panel">
-        <div class="panel-heading"><div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">SHARED ITINERARY STATE</div><h2>Agent collaboration</h2></div></div><span class="live-indicator" id="job-state">Ready</span></div>
-        <p class="subtle small">Specialists exchange structured findings.<br>Application code checks the schedule.</p>
-        <div class="agent-list" id="agent-list"></div>
-        <div class="run-metrics" id="run-metrics">No planning run yet.</div>
-        <div class="event-feed" id="event-feed" aria-live="polite"><p class="micro">Execution events and inter-agent requests will appear during planning.</p></div>
-      </section>
-      <section class="panel review-panel" id="review-panel">
-        <div class="panel-heading-title"><span class="chat-avatar" aria-hidden="true">C</span><div><div class="eyebrow">REVIEW BEFORE APPLYING</div><h2>Changes &amp; evidence</h2></div></div>
-        <div id="review-content"><div class="review-empty"><span class="review-symbol">◇</span><p>The current itinerary stays unchanged<br>until you accept a proposed revision.</p></div></div>
-      </section>
-      <section class="panel flower-panel" id="flower-panel" hidden><div class="eyebrow">FLOWER SUPERGRID</div><h3 id="flower-title">Planning on SuperGrid</h3><p class="micro" id="flower-note">Submitting the job as a Flower AgentApp run.</p><div class="run-metrics" id="flower-run" hidden></div><pre id="flower-command" hidden></pre><button id="copy-command" class="small-button" hidden>Copy command</button></section>
-      <footer class="sidebar-footer">OpenStreetMap data with attribution.<br>Flower-compatible agent orchestration.<br>No booking, payment, or cancellation tools.</footer>
     </aside>
   </main>
   <dialog id="details-dialog"><button class="dialog-close" id="close-details" aria-label="Close details">×</button><div id="details-content"></div></dialog>
